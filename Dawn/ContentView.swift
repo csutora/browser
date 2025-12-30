@@ -170,7 +170,7 @@ struct ContentView: View {
         .offset(x: sidebarOffset)
         .allowsHitTesting(sidebarOffset == 0)
         .zIndex(20)
-        .animation(useDockAnimation ? .easeInOut(duration: 0.35) : .sidebarSpring, value: sidebarOffset)
+        .animation(useDockAnimation ? .easeInOut(duration: isDocked ? 0.30 : 0.35) : .sidebarSpring, value: sidebarOffset)
     }
 
     @ViewBuilder
