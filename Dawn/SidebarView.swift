@@ -114,6 +114,9 @@ struct SidebarView: View {
         .onChange(of: tabManager.currentTabURL) { _, val in urlText = val }
         .onTapGesture { isUrlFieldFocused = false }
         .background(SidebarBackgroundHelper())
+        .onReceive(NotificationCenter.default.publisher(for: .focusURLBar)) { _ in
+            isUrlFieldFocused = true
+        }
     }
 }
 

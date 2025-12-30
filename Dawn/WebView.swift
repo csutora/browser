@@ -2,6 +2,17 @@ import SwiftUI
 import WebKit
 import AppKit
 
+// MARK: - Non-Draggable Hosting View
+/// NSHostingView subclass that prevents window dragging from its content
+class NonDraggableHostingView<Content: View>: NSHostingView<Content> {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        // Let SwiftUI handle the event, don't propagate to parent
+        super.mouseDown(with: event)
+    }
+}
+
 // MARK: - Web View Container
 struct WebViewContainer: View {
     var tabs: [Tab]
@@ -76,12 +87,16 @@ class AnimatedWebContainerView: NSView {
         return v
     }()
 
-    private lazy var settingsHostingView: NSHostingView<SettingsView> = {
-        let hv = NSHostingView(rootView: SettingsView())
+    private lazy var settingsHostingView: NonDraggableHostingView<SettingsView> = {
+        let hv = NonDraggableHostingView(rootView: SettingsView())
         hv.wantsLayer = true
         hv.layer?.cornerRadius = 9
         hv.layer?.masksToBounds = true
         hv.layer?.actions = ["position": NSNull(), "bounds": NSNull(), "frame": NSNull()]
+        // Disable safe area insets - settings view handles its own padding
+        if #available(macOS 13.3, *) {
+            hv.safeAreaRegions = []
+        }
         return hv
     }()
 
@@ -100,6 +115,11 @@ class AnimatedWebContainerView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
+        // Don't allow dragging/zooming when settings view is visible
+        if currentTabIsSettings {
+            return
+        }
+
         if event.clickCount == 2 {
             self.window?.zoom(nil)
         } else {

@@ -1,6 +1,10 @@
 import SwiftUI
 import SwiftData
 
+extension Notification.Name {
+    static let focusURLBar = Notification.Name("focusURLBar")
+}
+
 struct ContentView: View {
     @EnvironmentObject var tabManager: TabManager
 
@@ -15,6 +19,9 @@ struct ContentView: View {
     @State private var dragStartWidth: Double? = nil
     @State private var isResizing: Bool = false
     @State private var draggedTab: Tab?
+    @State private var useDockAnimation: Bool = false
+
+    private let keybindHandler = KeybindHandler.shared
 
     var isFloatingVisible: Bool {
         if isDocked { return false }
@@ -55,6 +62,7 @@ struct ContentView: View {
                 if let first = tabs.first { tabManager.selectTab(first) }
             }
             syncStates()
+            setupKeybindHandler()
         }
         .onChange(of: sidebarWidth) { _, newValue in
             mouseTracker.updateSettings(sidebarWidth: newValue, isDocked: isDocked)
@@ -63,6 +71,71 @@ struct ContentView: View {
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: newValue)
         }
         .onChange(of: tabs) { _, _ in syncStates() }
+    }
+
+    func setupKeybindHandler() {
+        keybindHandler.onAction = { [self] action in
+            handleKeybindAction(action)
+        }
+        keybindHandler.start()
+    }
+
+    func handleKeybindAction(_ action: KeybindAction) {
+        switch action {
+        case .newTab:
+            tabManager.createTab(existingCount: tabs.count)
+
+        case .closeTab:
+            guard let currentId = tabManager.currentTabId,
+                  let tab = tabs.first(where: { $0.id == currentId }) else { return }
+            tabManager.closeTab(tab, allTabs: tabs)
+
+        case .refresh:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.reload()
+
+        case .goBack:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.goBack()
+
+        case .goForward:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.goForward()
+
+        case .previousTab:
+            guard let currentId = tabManager.currentTabId,
+                  let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
+            let newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.count - 1
+            if newIndex >= 0 && newIndex < tabs.count {
+                tabManager.selectTab(tabs[newIndex])
+            }
+
+        case .nextTab:
+            guard let currentId = tabManager.currentTabId,
+                  let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
+            let newIndex = currentIndex < tabs.count - 1 ? currentIndex + 1 : 0
+            if newIndex >= 0 && newIndex < tabs.count {
+                tabManager.selectTab(tabs[newIndex])
+            }
+
+        case .focusURLBar:
+            NotificationCenter.default.post(name: .focusURLBar, object: nil)
+
+        case .toggleSidebar:
+            toggleDock()
+
+        case .copyURL:
+            if let url = tabManager.currentTabURL as String? {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+            }
+
+        case .openSettings:
+            tabManager.openSettings()
+        }
     }
 
     private var backgroundLayers: some View {
@@ -97,7 +170,7 @@ struct ContentView: View {
         .offset(x: sidebarOffset)
         .allowsHitTesting(sidebarOffset == 0)
         .zIndex(20)
-        .animation(.sidebarSpring, value: sidebarOffset)
+        .animation(useDockAnimation ? .easeInOut(duration: 0.35) : .sidebarSpring, value: sidebarOffset)
     }
 
     @ViewBuilder
@@ -115,11 +188,23 @@ struct ContentView: View {
     }
 
     func toggleDock() {
-        if isDocked {
-            // Set visibility BEFORE undocking to prevent isSidebarVisible flicker
+        // Read directly from UserDefaults to ensure current state (closure capture can have stale struct)
+        let currentlyDocked = UserDefaults.standard.bool(forKey: "isDocked")
+
+        // Use matching animation for sidebar to sync with webview border (0.35s ease-in-out)
+        useDockAnimation = true
+
+        if currentlyDocked {
+            // Undocking: Set visibility BEFORE undocking to prevent isSidebarVisible flicker
             mouseTracker.shouldShowSidebar = true
         }
-        isDocked.toggle()
+
+        isDocked = !currentlyDocked
+
+        // Reset animation flag after animation completes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [self] in
+            useDockAnimation = false
+        }
     }
 
     func syncStates() {

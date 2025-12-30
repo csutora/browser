@@ -40,16 +40,14 @@ struct BrowserApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
 
-            // Settings command (Cmd+,)
+            // Settings menu item (keybind handled by KeybindHandler)
             CommandGroup(after: .appInfo) {
                 Button("Settings...") {
-                    // Ensure modelContext is set before opening settings
                     if tabManager.modelContext == nil {
                         tabManager.modelContext = modelContainer.mainContext
                     }
                     tabManager.openSettings()
                 }
-                .keyboardShortcut(",", modifiers: .command)
             }
         }
         .modelContainer(modelContainer)
