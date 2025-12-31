@@ -21,6 +21,7 @@ final class Tab: Identifiable {
     var scrollX: Double = 0.0
     var scrollY: Double = 0.0
     var zoomScale: Double = 1.0
+    var backgroundColorHex: String?
 
     var tabType: TabType {
         get { TabType(rawValue: tabTypeRaw) ?? .web }
@@ -28,6 +29,11 @@ final class Tab: Identifiable {
     }
 
     var isSettings: Bool { tabType == .settings }
+
+    var backgroundColor: Color? {
+        guard let hex = backgroundColorHex else { return nil }
+        return Color(hex: hex)
+    }
 
     init(id: UUID = UUID(), title: String = "New Tab", url: String = "https://www.google.com", sortIndex: Int = 0, tabType: TabType = .web) {
         self.id = id
@@ -114,7 +120,7 @@ class TabManager: ObservableObject {
         }
     }
 
-    func updateTab(_ id: UUID, title: String? = nil, url: String? = nil, interactionState: Data? = nil, scroll: CGPoint? = nil, zoom: Double? = nil) {
+    func updateTab(_ id: UUID, title: String? = nil, url: String? = nil, scroll: CGPoint? = nil, backgroundColorHex: String? = nil) {
         guard let context = modelContext else { return }
         let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == id })
         if let tab = try? context.fetch(descriptor).first {
@@ -123,12 +129,11 @@ class TabManager: ObservableObject {
                 tab.url = u
                 if id == currentTabId { currentTabURL = u }
             }
-            if let state = interactionState { tab.interactionState = state }
             if let s = scroll {
                 tab.scrollX = s.x
                 tab.scrollY = s.y
             }
-            if let z = zoom { tab.zoomScale = z }
+            if let bg = backgroundColorHex { tab.backgroundColorHex = bg }
             scheduleSave()
         }
     }
@@ -136,43 +141,150 @@ class TabManager: ObservableObject {
 
 // MARK: - Browser State
 class BrowserState: ObservableObject {
+    let webPage = WebPage()
+    let tabId: UUID
+    weak var tabManager: TabManager?
+
+    private var pendingURL: URL?
+    private var hasLoadedInitialContent = false
+    private var lastStyledURL: URL?
+
+    // Published properties for UI bindings
     @Published var canGoBack = false
     @Published var canGoForward = false
     @Published var isLoading = false
-    @Published var backgroundColor: Color = .clear
+    @Published var fetchedBackgroundColor: Color?
 
-    var webView: WKWebView?
-    var tabId: UUID
-    weak var tabManager: TabManager?
-
-    var pendingURL: URL?
-    var restorationData: Data?
-    var savedScroll: CGPoint?
-    var savedZoom: Double?
-
-    init(tabId: UUID, tabManager: TabManager, restorationData: Data? = nil, scroll: CGPoint? = nil, zoom: Double? = nil) {
+    init(tabId: UUID, tabManager: TabManager, initialURL: URL?) {
         self.tabId = tabId
         self.tabManager = tabManager
-        self.restorationData = restorationData
-        self.savedScroll = scroll
-        self.savedZoom = zoom
+        self.pendingURL = initialURL
     }
 
-    func loadURL(_ s: String) {
-        var u = s
-        if !u.lowercased().hasPrefix("http") { u = "https://" + u }
-        guard let url = URL(string: u) else { return }
+    // MARK: - Event Handlers (called from SwiftUI onChange)
 
-        if let w = webView {
-            w.load(URLRequest(url: url))
-        } else {
-            pendingURL = url
-            restorationData = nil
+    func handleURLChange(_ newURL: URL?) {
+        guard let url = newURL else { return }
+        tabManager?.updateTab(tabId, url: url.absoluteString)
+        updateNavigationState()
+    }
+
+    func handleTitleChange(_ newTitle: String) {
+        guard !newTitle.isEmpty else { return }
+        tabManager?.updateTab(tabId, title: newTitle)
+    }
+
+    func handleLoadingChange(_ loading: Bool) {
+        isLoading = loading
+
+        // Fetch background color when loading finishes
+        if !loading, let url = webPage.url, url != lastStyledURL {
+            lastStyledURL = url
+            updateNavigationState()
+
+            Task { @MainActor in
+                // Delay to ensure CSS is fully applied
+                try? await Task.sleep(for: .milliseconds(500))
+                self.fetchBackgroundColor()
+            }
         }
     }
 
-    func goBack() { webView?.goBack() }
-    func goForward() { webView?.goForward() }
-    func reload() { webView?.reload() }
-    func stopLoading() { webView?.stopLoading() }
+    private func updateNavigationState() {
+        canGoBack = !webPage.backForwardList.backList.isEmpty
+        canGoForward = !webPage.backForwardList.forwardList.isEmpty
+    }
+
+    private func fetchBackgroundColor() {
+        let js = """
+        function getColor(el) {
+            if (!el) return null;
+            var bg = getComputedStyle(el).backgroundColor;
+            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return bg;
+            return null;
+        }
+        return getColor(document.body) || getColor(document.documentElement) || 'rgb(255, 255, 255)';
+        """
+
+        Task { @MainActor in
+            do {
+                let result = try await webPage.callJavaScript(js)
+                if let colorString = result as? String, let hex = self.parseColorToHex(colorString) {
+                    self.fetchedBackgroundColor = Color(hex: hex)
+                    self.tabManager?.updateTab(self.tabId, backgroundColorHex: hex)
+                }
+            } catch {
+                // Ignore JS errors
+            }
+        }
+    }
+
+    private func parseColorToHex(_ colorString: String) -> String? {
+        // Parse rgb(r, g, b) or rgba(r, g, b, a) format
+        let pattern = #"rgba?\((\d+),\s*(\d+),\s*(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: colorString, range: NSRange(colorString.startIndex..., in: colorString)) else {
+            return nil
+        }
+
+        guard let rRange = Range(match.range(at: 1), in: colorString),
+              let gRange = Range(match.range(at: 2), in: colorString),
+              let bRange = Range(match.range(at: 3), in: colorString),
+              let r = Int(colorString[rRange]),
+              let g = Int(colorString[gRange]),
+              let b = Int(colorString[bRange]) else {
+            return nil
+        }
+
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+
+    func loadInitialContentIfNeeded() {
+        // Only load once per BrowserState lifetime
+        guard !hasLoadedInitialContent, let url = pendingURL else { return }
+        hasLoadedInitialContent = true
+        webPage.load(URLRequest(url: url))
+    }
+
+    func loadURL(_ s: String) {
+        var urlString = s
+        if !urlString.lowercased().hasPrefix("http") {
+            urlString = "https://" + urlString
+        }
+        guard let url = URL(string: urlString) else { return }
+        webPage.load(URLRequest(url: url))
+    }
+
+    func goBack() {
+        guard let item = webPage.backForwardList.backList.last else { return }
+        webPage.load(item)
+    }
+
+    func goForward() {
+        guard let item = webPage.backForwardList.forwardList.first else { return }
+        webPage.load(item)
+    }
+
+    func reload() {
+        lastStyledURL = nil  // Force re-fetch on reload
+        webPage.reload()
+    }
+
+    func stopLoading() {
+        webPage.stopLoading()
+    }
+}
+
+// MARK: - Color Extension
+extension Color {
+    init?(hex: String) {
+        var hexString = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hexString.hasPrefix("#") { hexString.removeFirst() }
+        guard hexString.count == 6,
+              let int = UInt64(hexString, radix: 16) else { return nil }
+        let r = Double((int >> 16) & 0xFF) / 255.0
+        let g = Double((int >> 8) & 0xFF) / 255.0
+        let b = Double(int & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
 }

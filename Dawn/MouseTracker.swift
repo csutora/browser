@@ -15,19 +15,30 @@ class MouseTracker: ObservableObject {
     private var globalMonitor: Any?
     private var observers: [NSObjectProtocol] = []
 
+    // Throttle mouse checks to 15fps (~67ms) - sidebar show/hide doesn't need high precision
+    private var lastCheckTime: CFTimeInterval = 0
+    private let checkInterval: CFTimeInterval = 1.0 / 15.0  // 15fps
+
     init() {
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged]
 
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            self?.checkMouse()
+            self?.throttledCheckMouse()
             return event
         }
 
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
-            self?.checkMouse()
+            self?.throttledCheckMouse()
         }
 
         setupWindowObservers()
+    }
+
+    private func throttledCheckMouse() {
+        let now = CACurrentMediaTime()
+        guard now - lastCheckTime >= checkInterval else { return }
+        lastCheckTime = now
+        checkMouse()
     }
 
     private func setupWindowObservers() {

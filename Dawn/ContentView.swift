@@ -33,10 +33,6 @@ struct ContentView: View {
         isDocked ? 0 : (isFloatingVisible ? 0 : -(CGFloat(sidebarWidth) + 50))
     }
 
-    var webLeftPadding: CGFloat {
-        isDocked ? CGFloat(sidebarWidth) - 8 : 0
-    }
-
     var body: some View {
         ZStack(alignment: .topLeading) {
             backgroundLayers
@@ -47,7 +43,7 @@ struct ContentView: View {
                 browserStates: browserStates,
                 currentTabId: tabManager.currentTabId,
                 isDocked: isDocked,
-                webLeftPadding: webLeftPadding
+                sidebarWidth: CGFloat(sidebarWidth)
             )
 
             sidebar
@@ -170,7 +166,7 @@ struct ContentView: View {
         .offset(x: sidebarOffset)
         .allowsHitTesting(sidebarOffset == 0)
         .zIndex(20)
-        .animation(useDockAnimation ? .easeInOut(duration: isDocked ? 0.30 : 0.35) : .sidebarSpring, value: sidebarOffset)
+        .animation(.sidebarSpring, value: sidebarOffset)
     }
 
     @ViewBuilder
@@ -188,38 +184,26 @@ struct ContentView: View {
     }
 
     func toggleDock() {
-        // Read directly from UserDefaults to ensure current state (closure capture can have stale struct)
         let currentlyDocked = UserDefaults.standard.bool(forKey: "isDocked")
 
-        // Use matching animation for sidebar to sync with webview border (0.35s ease-in-out)
-        useDockAnimation = true
-
         if currentlyDocked {
-            // Undocking: Set visibility BEFORE undocking to prevent isSidebarVisible flicker
             mouseTracker.shouldShowSidebar = true
         }
 
         isDocked = !currentlyDocked
-
-        // Reset animation flag after animation completes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [self] in
-            useDockAnimation = false
-        }
     }
 
     func syncStates() {
         // Only create BrowserState for web tabs, not settings
         for tab in tabs where !tab.isSettings {
             if browserStates[tab.id] == nil {
+                let initialURL = URL(string: tab.url)
                 let s = BrowserState(
                     tabId: tab.id,
                     tabManager: tabManager,
-                    restorationData: tab.interactionState,
-                    scroll: CGPoint(x: tab.scrollX, y: tab.scrollY),
-                    zoom: tab.zoomScale
+                    initialURL: initialURL
                 )
                 browserStates[tab.id] = s
-                if s.restorationData == nil && s.pendingURL == nil { s.loadURL(tab.url) }
             }
         }
         let activeWebTabIds = tabs.filter { !$0.isSettings }.map { $0.id }

@@ -25,19 +25,31 @@ struct ResizeHandleView: NSViewRepresentable {
 
         private var startX: CGFloat = 0
 
+        // Throttle resize updates to 60fps (~16ms) for smooth but efficient resizing
+        private var lastUpdateTime: CFTimeInterval = 0
+        private let updateInterval: CFTimeInterval = 1.0 / 60.0  // 60fps
+
         override var mouseDownCanMoveWindow: Bool { false }
 
         override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
         override func mouseDown(with event: NSEvent) {
             self.window?.isMovableByWindowBackground = false
             startX = event.locationInWindow.x
+            lastUpdateTime = 0  // Reset throttle on drag start
             onDragStart?()
         }
         override func mouseDragged(with event: NSEvent) {
+            let now = CACurrentMediaTime()
+            guard now - lastUpdateTime >= updateInterval else { return }
+            lastUpdateTime = now
+
             let delta = event.locationInWindow.x - startX
             onDragUpdate?(delta)
         }
         override func mouseUp(with event: NSEvent) {
+            // Always send final position on mouse up
+            let delta = event.locationInWindow.x - startX
+            onDragUpdate?(delta)
             onDragEnd?()
             self.window?.isMovableByWindowBackground = true
         }
@@ -154,14 +166,4 @@ class DraggableContainerView<Content: View>: NSView, NSDraggingSource {
 // MARK: - Extensions
 extension Animation {
     static let sidebarSpring = Animation.spring(response: 0.35, dampingFraction: 0.8)
-}
-
-extension Color {
-    static func from(dict: [String: Double]) -> Color {
-        let r = dict["r"] ?? 255
-        let g = dict["g"] ?? 255
-        let b = dict["b"] ?? 255
-        let a = dict["a"] ?? 1.0
-        return Color(red: r / 255.0, green: g / 255.0, blue: b / 255.0, opacity: a)
-    }
 }
