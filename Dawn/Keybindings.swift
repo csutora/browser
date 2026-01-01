@@ -15,6 +15,38 @@ let specialKeyNames: [UInt16: String] = [
     0x40: "F17", 0x4F: "F18", 0x50: "F19", 0x5A: "F20",
 ]
 
+// MARK: - KeyCode to Character Translation
+/// Translates a keyCode to its base character (without modifiers) using the current keyboard layout
+func characterForKeyCode(_ keyCode: UInt16) -> String? {
+    guard let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+          let layoutDataPtr = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData) else {
+        return nil
+    }
+
+    let layoutData = unsafeBitCast(layoutDataPtr, to: CFData.self)
+    let keyboardLayout = unsafeBitCast(CFDataGetBytePtr(layoutData), to: UnsafePointer<UCKeyboardLayout>.self)
+
+    var deadKeyState: UInt32 = 0
+    var chars = [UniChar](repeating: 0, count: 4)
+    var actualLength: Int = 0
+
+    let status = UCKeyTranslate(
+        keyboardLayout,
+        keyCode,
+        UInt16(kUCKeyActionDown),
+        0, // No modifiers - get the base character
+        UInt32(LMGetKbdType()),
+        OptionBits(kUCKeyTranslateNoDeadKeysBit),
+        &deadKeyState,
+        chars.count,
+        &actualLength,
+        &chars
+    )
+
+    guard status == noErr, actualLength > 0 else { return nil }
+    return String(utf16CodeUnits: chars, count: actualLength)
+}
+
 // MARK: - Key Combo
 struct KeyCombo: Codable, Identifiable {
     var id: String { "\(keyCode)-\(modifiers)" }
@@ -42,7 +74,11 @@ struct KeyCombo: Codable, Identifiable {
         if let special = specialKeyNames[keyCode] {
             return special
         }
-        // Regular keys: use the character from keyboard layout
+        // Regular keys: translate keyCode to base character using current keyboard layout
+        if let char = characterForKeyCode(keyCode), !char.isEmpty {
+            return char.uppercased()
+        }
+        // Fallback to stored character if translation fails
         if let char = fallbackCharacter, !char.isEmpty {
             return char.uppercased()
         }
@@ -65,7 +101,9 @@ struct KeyCombo: Codable, Identifiable {
         if hasOption { parts.append("option opt alt") }
         if hasShift { parts.append("shift") }
         if hasCommand { parts.append("command cmd meta super win") }
-        parts.append(keyString.lowercased())
+        // Use base character from keyCode for searching
+        let baseKey = characterForKeyCode(keyCode)?.lowercased() ?? keyString.lowercased()
+        parts.append(baseKey)
         return parts.joined(separator: " ")
     }
 
@@ -121,6 +159,7 @@ extension KeyCombo: Hashable {
 enum KeybindAction: String, CaseIterable, Codable, Identifiable {
     case newTab = "new_tab"
     case closeTab = "close_tab"
+    case reopenClosedTab = "reopen_closed_tab"
     case refresh = "refresh"
     case goBack = "go_back"
     case goForward = "go_forward"
@@ -130,6 +169,9 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
     case toggleSidebar = "toggle_sidebar"
     case copyURL = "copy_url"
     case openSettings = "open_settings"
+    case zoomIn = "zoom_in"
+    case zoomOut = "zoom_out"
+    case resetZoom = "reset_zoom"
 
     var id: String { rawValue }
 
@@ -137,6 +179,7 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .newTab: return "New Tab"
         case .closeTab: return "Close Tab"
+        case .reopenClosedTab: return "Reopen Closed Tab"
         case .refresh: return "Refresh Page"
         case .goBack: return "Go Back"
         case .goForward: return "Go Forward"
@@ -146,6 +189,9 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
         case .toggleSidebar: return "Dock/Undock Sidebar"
         case .copyURL: return "Copy URL to Clipboard"
         case .openSettings: return "Open Settings"
+        case .zoomIn: return "Zoom In"
+        case .zoomOut: return "Zoom Out"
+        case .resetZoom: return "Reset Zoom"
         }
     }
 
@@ -155,6 +201,8 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
             return [KeyCombo(keyCode: 0x11, char: "t", command: true)]
         case .closeTab:
             return [KeyCombo(keyCode: 0x0D, char: "w", command: true)]
+        case .reopenClosedTab:
+            return [KeyCombo(keyCode: 0x11, char: "t", command: true, shift: true)]
         case .refresh:
             return [KeyCombo(keyCode: 0x0F, char: "r", command: true)]
         case .goBack:
@@ -179,6 +227,12 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
             return [KeyCombo(keyCode: 0x08, char: "c", command: true, shift: true)]
         case .openSettings:
             return [KeyCombo(keyCode: 0x2B, char: ",", command: true)]
+        case .zoomIn:
+            return [KeyCombo(keyCode: 0x18, char: "=", command: true)] // = key (same as + without shift)
+        case .zoomOut:
+            return [KeyCombo(keyCode: 0x1B, char: "-", command: true)]
+        case .resetZoom:
+            return [KeyCombo(keyCode: 0x1D, char: "0", command: true)]
         }
     }
 }
@@ -863,7 +917,7 @@ struct KeybindSearchParser {
 // MARK: - Keybinds List View
 struct KeybindsView: View {
     @ObservedObject var manager: KeybindingsManager
-    @Binding var showKeybinds: Bool
+    let onBack: () -> Void
 
     @State private var searchText = ""
     @State private var editingAction: KeybindAction?
@@ -900,9 +954,7 @@ struct KeybindsView: View {
                     // Header with back button
                     HStack(spacing: 12) {
                         Button(action: {
-                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                                showKeybinds = false
-                            }
+                            onBack()
                         }) {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 14, weight: .semibold))

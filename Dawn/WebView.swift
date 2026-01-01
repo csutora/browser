@@ -1,6 +1,14 @@
 import SwiftUI
 import WebKit
 
+// MARK: - Settings Path Helper
+func extractSettingsPath(from url: String) -> String {
+    // Parse dawn://settings or dawn://keybinds etc.
+    guard url.hasPrefix("dawn://") else { return "settings" }
+    let path = String(url.dropFirst("dawn://".count))
+    return path.isEmpty ? "settings" : path
+}
+
 // MARK: - Web View Container
 struct WebViewContainer: View {
     var tabs: [Tab]
@@ -8,6 +16,7 @@ struct WebViewContainer: View {
     var currentTabId: UUID?
     var isDocked: Bool
     var sidebarWidth: CGFloat
+    var onSettingsNavigate: ((String) -> Void)?
 
     private let defaultColor = Color(NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0))
 
@@ -21,6 +30,25 @@ struct WebViewContainer: View {
             return nil
         }
         return tab.backgroundColor
+    }
+
+    // Check if current tab is settings
+    private var currentTabIsSettings: Bool {
+        guard let currentId = currentTabId,
+              let currentTab = tabs.first(where: { $0.id == currentId }) else {
+            return false
+        }
+        return currentTab.isSettings
+    }
+
+    // Get settings path for current tab
+    private var currentSettingsPath: String {
+        guard let currentId = currentTabId,
+              let currentTab = tabs.first(where: { $0.id == currentId }),
+              currentTab.isSettings else {
+            return "settings"
+        }
+        return extractSettingsPath(from: currentTab.url)
     }
 
     var body: some View {
@@ -40,23 +68,34 @@ struct WebViewContainer: View {
                     .frame(width: frame.width, height: frame.height)
                     .position(x: frame.midX, y: frame.midY)
 
-                // Content
-                if let currentId = currentTabId,
-                   let currentTab = tabs.first(where: { $0.id == currentId }) {
-                    if currentTab.isSettings {
-                        SettingsViewContainer()
-                            .frame(width: frame.width, height: frame.height)
-                            .clipShape(RoundedRectangle(cornerRadius: 9))
-                            .position(x: frame.midX, y: frame.midY)
-                    } else if let state = browserStates[currentId] {
-                        WebPageView(browserState: state, onBackgroundColorChange: { color in
-                            displayedBackgroundColor = color
-                        })
-                            .frame(width: frame.width, height: frame.height)
-                            .clipShape(RoundedRectangle(cornerRadius: 9))
-                            .position(x: frame.midX, y: frame.midY)
+                // Keep all web views alive, control visibility with NSView.isHidden
+                ForEach(tabs.filter { !$0.isSettings }) { tab in
+                    if let state = browserStates[tab.id] {
+                        let isActive = tab.id == currentTabId
+                        WebPageView(
+                            browserState: state,
+                            isVisible: isActive,
+                            onBackgroundColorChange: { color in
+                                if isActive {
+                                    displayedBackgroundColor = color
+                                }
+                            }
+                        )
+                        .frame(width: frame.width, height: frame.height)
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                        .position(x: frame.midX, y: frame.midY)
                     }
                 }
+
+                // Settings view - kept alive, visibility controlled
+                SettingsViewWrapper(
+                    isVisible: currentTabIsSettings,
+                    settingsPath: currentSettingsPath,
+                    onNavigate: { path in onSettingsNavigate?(path) }
+                )
+                .frame(width: frame.width, height: frame.height)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .position(x: frame.midX, y: frame.midY)
 
                 // Opaque stroke to cover anti-aliased corner bleeding
                 RoundedRectangle(cornerRadius: 10)
@@ -70,7 +109,6 @@ struct WebViewContainer: View {
         .ignoresSafeArea()
         .animation(.sidebarSpring, value: isDocked)
         .onChange(of: currentTabId) { _, newId in
-            // Only update if new tab has a cached color, otherwise keep previous
             if let cached = cachedBackgroundColor(for: newId) {
                 displayedBackgroundColor = cached
             }
@@ -83,48 +121,98 @@ struct WebViewContainer: View {
     }
 }
 
-// MARK: - Settings View Container (prevents window dragging)
-struct SettingsViewContainer: NSViewRepresentable {
+// MARK: - Settings View Wrapper (kept alive, visibility controlled)
+struct SettingsViewWrapper: NSViewRepresentable {
+    let isVisible: Bool
+    let settingsPath: String
+    let onNavigate: (String) -> Void
+
     func makeNSView(context: Context) -> NSHostingView<SettingsView> {
-        let view = NonDraggableHostingView(rootView: SettingsView())
+        let navState = SettingsNavigationState()
+        navState.currentPath = settingsPath
+        navState.onNavigate = onNavigate
+        context.coordinator.navigationState = navState
+
+        let view = NSHostingView(rootView: SettingsView(navigationState: navState))
+        view.safeAreaRegions = []
         view.layer?.cornerRadius = 9
         view.layer?.masksToBounds = true
+        view.isHidden = !isVisible
         return view
     }
 
-    func updateNSView(_ nsView: NSHostingView<SettingsView>, context: Context) {}
-}
+    func updateNSView(_ nsView: NSHostingView<SettingsView>, context: Context) {
+        nsView.isHidden = !isVisible
 
-// Helper to prevent window dragging from settings content
-private class NonDraggableHostingView<Content: View>: NSHostingView<Content> {
-    override var mouseDownCanMoveWindow: Bool { false }
+        if let navState = context.coordinator.navigationState {
+            if isVisible && navState.currentPath != settingsPath {
+                navState.currentPath = settingsPath
+            }
+            navState.onNavigate = onNavigate
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    class Coordinator {
+        var navigationState: SettingsNavigationState?
+    }
 }
 
 // MARK: - WebPage View (native SwiftUI WebView)
 struct WebPageView: View {
     @ObservedObject var browserState: BrowserState
+    var isVisible: Bool = true
     var onBackgroundColorChange: ((Color) -> Void)?
 
     var body: some View {
-        WebView(browserState.webPage)
-            .webViewBackForwardNavigationGestures(.enabled)
-            .webViewContentBackground(.hidden)
-            .task(id: browserState.tabId) {
-                browserState.loadInitialContentIfNeeded()
+        HiddenControlView(isVisible: isVisible) {
+            WebView(browserState.webPage)
+                .webViewBackForwardNavigationGestures(.enabled)
+                .webViewContentBackground(.hidden)
+        }
+        .task(id: browserState.tabId) {
+            browserState.loadInitialContentIfNeeded()
+        }
+        .onChange(of: browserState.fetchedBackgroundColor) { _, newColor in
+            if let color = newColor {
+                onBackgroundColorChange?(color)
             }
-            .onChange(of: browserState.fetchedBackgroundColor) { _, newColor in
-                if let color = newColor {
-                    onBackgroundColorChange?(color)
-                }
-            }
-            .onChange(of: browserState.webPage.url) { _, newURL in
-                browserState.handleURLChange(newURL)
-            }
-            .onChange(of: browserState.webPage.title) { _, newTitle in
-                browserState.handleTitleChange(newTitle)
-            }
-            .onChange(of: browserState.webPage.isLoading) { _, isLoading in
-                browserState.handleLoadingChange(isLoading)
-            }
+        }
+        .onChange(of: browserState.webPage.url) { _, newURL in
+            browserState.handleURLChange(newURL)
+        }
+        .onChange(of: browserState.webPage.title) { _, newTitle in
+            browserState.handleTitleChange(newTitle)
+        }
+        .onChange(of: browserState.webPage.isLoading) { _, isLoading in
+            browserState.handleLoadingChange(isLoading)
+        }
     }
 }
+
+// MARK: - Hidden Control View (sets NSView.isHidden)
+struct HiddenControlView<Content: View>: NSViewRepresentable {
+    let isVisible: Bool
+    @ViewBuilder let content: Content
+
+    init(isVisible: Bool, @ViewBuilder content: () -> Content) {
+        self.isVisible = isVisible
+        self.content = content()
+    }
+
+    func makeNSView(context: Context) -> NSHostingView<Content> {
+        let hostingView = NSHostingView(rootView: content)
+        hostingView.safeAreaRegions = []
+        hostingView.isHidden = !isVisible
+        return hostingView
+    }
+
+    func updateNSView(_ nsView: NSHostingView<Content>, context: Context) {
+        nsView.rootView = content
+        nsView.isHidden = !isVisible
+    }
+}
+

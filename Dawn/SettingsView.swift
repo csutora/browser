@@ -1,8 +1,24 @@
 import SwiftUI
+import Combine
+
+// MARK: - Settings Navigation State
+class SettingsNavigationState: ObservableObject {
+    @Published var currentPath: String = "settings"
+    var onNavigate: ((String) -> Void)?
+
+    func navigate(to path: String) {
+        currentPath = path
+        onNavigate?(path)
+    }
+}
 
 struct SettingsView: View {
+    @ObservedObject var navigationState: SettingsNavigationState
     @StateObject private var keybindingsManager = KeybindingsManager.shared
-    @State private var showKeybinds = false
+
+    private var showKeybinds: Bool {
+        navigationState.currentPath == "keybinds"
+    }
 
     var body: some View {
         ZStack {
@@ -17,7 +33,9 @@ struct SettingsView: View {
             }
 
             if showKeybinds {
-                KeybindsView(manager: keybindingsManager, showKeybinds: $showKeybinds)
+                KeybindsView(manager: keybindingsManager, onBack: {
+                    navigationState.navigate(to: "settings")
+                })
                     .transition(.asymmetric(
                         insertion: .move(edge: .trailing).combined(with: .opacity),
                         removal: .move(edge: .trailing).combined(with: .opacity)
@@ -58,9 +76,7 @@ struct SettingsView: View {
                     title: "Keyboard Shortcuts",
                     subtitle: "\(KeybindAction.allCases.count) shortcuts configured"
                 ) {
-                    withAnimation {
-                        showKeybinds = true
-                    }
+                    navigationState.navigate(to: "keybinds")
                 }
 
                 // Sync Section (placeholder)

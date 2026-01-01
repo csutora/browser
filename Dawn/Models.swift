@@ -22,6 +22,7 @@ final class Tab: Identifiable {
     var scrollY: Double = 0.0
     var zoomScale: Double = 1.0
     var backgroundColorHex: String?
+    var lastAccessedAt: Date = Date()
 
     var tabType: TabType {
         get { TabType(rawValue: tabTypeRaw) ?? .web }
@@ -44,11 +45,24 @@ final class Tab: Identifiable {
     }
 }
 
+// MARK: - Closed Tab Info (for reopen stack)
+struct ClosedTabInfo {
+    let title: String
+    let url: String
+    let sortIndex: Int
+    let tabType: TabType
+    let backgroundColorHex: String?
+}
+
 // MARK: - Tab Manager
 class TabManager: ObservableObject {
     @AppStorage("currentTabId") var currentTabIdString: String = ""
     var modelContext: ModelContext?
     private var saveTask: DispatchWorkItem?
+
+    /// Stack of recently closed tabs (most recent last)
+    private var closedTabsStack: [ClosedTabInfo] = []
+    private let maxClosedTabs = 20
 
     var currentTabId: UUID? {
         get { UUID(uuidString: currentTabIdString) }
@@ -56,6 +70,10 @@ class TabManager: ObservableObject {
     }
 
     var currentTabURL: String = ""
+
+    var canReopenClosedTab: Bool {
+        !closedTabsStack.isEmpty
+    }
 
     private func scheduleSave() {
         saveTask?.cancel()
@@ -80,6 +98,23 @@ class TabManager: ObservableObject {
 
     func closeTab(_ tab: Tab, allTabs: [Tab]) {
         guard let context = modelContext else { return }
+
+        // Save tab info to closed stack before deleting (skip settings tabs)
+        if !tab.isSettings {
+            let closedInfo = ClosedTabInfo(
+                title: tab.title,
+                url: tab.url,
+                sortIndex: tab.sortIndex,
+                tabType: tab.tabType,
+                backgroundColorHex: tab.backgroundColorHex
+            )
+            closedTabsStack.append(closedInfo)
+            // Limit stack size
+            if closedTabsStack.count > maxClosedTabs {
+                closedTabsStack.removeFirst()
+            }
+        }
+
         if currentTabId == tab.id {
             if let index = allTabs.firstIndex(of: tab) {
                 let newIndex = index > 0 ? index - 1 : (index + 1 < allTabs.count ? index + 1 : -1)
@@ -96,9 +131,49 @@ class TabManager: ObservableObject {
         try? context.save()
     }
 
+    func reopenLastClosedTab(existingCount: Int) {
+        guard let context = modelContext, let closedInfo = closedTabsStack.popLast() else { return }
+
+        let tab = Tab(
+            title: closedInfo.title,
+            url: closedInfo.url,
+            sortIndex: existingCount,
+            tabType: closedInfo.tabType
+        )
+        tab.backgroundColorHex = closedInfo.backgroundColorHex
+
+        context.insert(tab)
+        currentTabId = tab.id
+        currentTabURL = tab.url
+        try? context.save()
+    }
+
     func selectTab(_ tab: Tab) {
         currentTabId = tab.id
         currentTabURL = tab.url
+        // Update lastAccessedAt through the context to avoid threading issues
+        updateLastAccessedAt(for: tab.id)
+    }
+
+    private func updateLastAccessedAt(for tabId: UUID) {
+        guard let context = modelContext else { return }
+        let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == tabId })
+        if let tab = try? context.fetch(descriptor).first {
+            tab.lastAccessedAt = Date()
+            scheduleSave()
+        }
+    }
+
+    func updateSettingsPath(_ path: String) {
+        guard let context = modelContext,
+              let currentId = currentTabId else { return }
+        let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == currentId })
+        if let tab = try? context.fetch(descriptor).first, tab.isSettings {
+            let newURL = "dawn://\(path)"
+            tab.url = newURL
+            currentTabURL = newURL
+            try? context.save()
+        }
     }
 
     func openSettings() {
@@ -154,6 +229,12 @@ class BrowserState: ObservableObject {
     @Published var canGoForward = false
     @Published var isLoading = false
     @Published var fetchedBackgroundColor: Color?
+    @Published var currentZoom: Double = 1.0
+
+    // Zoom constraints
+    private let minZoom: Double = 0.5
+    private let maxZoom: Double = 3.0
+    private let zoomStep: Double = 0.1
 
     init(tabId: UUID, tabManager: TabManager, initialURL: URL?) {
         self.tabId = tabId
@@ -272,6 +353,31 @@ class BrowserState: ObservableObject {
 
     func stopLoading() {
         webPage.stopLoading()
+    }
+
+    // MARK: - Zoom
+
+    func zoomIn() {
+        let newZoom = min(currentZoom + zoomStep, maxZoom)
+        setZoom(newZoom)
+    }
+
+    func zoomOut() {
+        let newZoom = max(currentZoom - zoomStep, minZoom)
+        setZoom(newZoom)
+    }
+
+    func resetZoom() {
+        setZoom(1.0)
+    }
+
+    private func setZoom(_ zoom: Double) {
+        currentZoom = zoom
+        // Use JavaScript to set zoom on the document
+        let js = "document.documentElement.style.zoom = '\(zoom)'"
+        Task { @MainActor in
+            _ = try? await webPage.callJavaScript(js)
+        }
     }
 }
 

@@ -11,6 +11,7 @@ struct ContentView: View {
     @Query(sort: \Tab.sortIndex, animation: .spring(response: 0.35, dampingFraction: 0.75)) private var tabs: [Tab]
 
     @StateObject private var mouseTracker = MouseTracker()
+    @StateObject private var commandPaletteState = CommandPaletteState()
     @State private var browserStates: [UUID: BrowserState] = [:]
 
     @AppStorage("isDocked") private var isDocked: Bool = true
@@ -43,14 +44,37 @@ struct ContentView: View {
                 browserStates: browserStates,
                 currentTabId: tabManager.currentTabId,
                 isDocked: isDocked,
-                sidebarWidth: CGFloat(sidebarWidth)
+                sidebarWidth: CGFloat(sidebarWidth),
+                onSettingsNavigate: { path in
+                    tabManager.updateSettingsPath(path)
+                }
             )
 
             sidebar
 
             resizeHandle
+
+            // Command Palette overlay
+            if commandPaletteState.isVisible {
+                CommandPaletteView(
+                    state: commandPaletteState,
+                    onSubmit: { suggestionType in
+                        handleCommandPaletteSubmit(suggestionType)
+                    },
+                    onSwitchToTab: { tab in
+                        tabManager.selectTab(tab)
+                        commandPaletteState.hide()
+                    },
+                    onDismiss: {
+                        commandPaletteState.hide()
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                .zIndex(100)
+            }
         }
         .ignoresSafeArea()
+        .animation(.spring(response: 0.25, dampingFraction: 0.9), value: commandPaletteState.isVisible)
         .onAppear {
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: isDocked)
 
@@ -71,6 +95,19 @@ struct ContentView: View {
 
     func setupKeybindHandler() {
         keybindHandler.onAction = { [self] action in
+            // If command palette is open, close it for certain actions
+            if commandPaletteState.isVisible {
+                switch action {
+                case .closeTab:
+                    // Close palette when closing tab
+                    commandPaletteState.hide(saveText: false)
+                case .newTab, .focusURLBar:
+                    // These reopen palette in different mode, so close first
+                    commandPaletteState.hide(saveText: action == .newTab)
+                default:
+                    break
+                }
+            }
             handleKeybindAction(action)
         }
         keybindHandler.start()
@@ -79,12 +116,20 @@ struct ContentView: View {
     func handleKeybindAction(_ action: KeybindAction) {
         switch action {
         case .newTab:
-            tabManager.createTab(existingCount: tabs.count)
+            // Show command palette in newTab mode - recent tabs by last accessed, excluding current
+            let recentTabs = tabs
+                .filter { $0.id != tabManager.currentTabId }
+                .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
+                .prefix(5)
+            commandPaletteState.show(mode: .newTab, recentTabs: Array(recentTabs))
 
         case .closeTab:
             guard let currentId = tabManager.currentTabId,
                   let tab = tabs.first(where: { $0.id == currentId }) else { return }
             tabManager.closeTab(tab, allTabs: tabs)
+
+        case .reopenClosedTab:
+            tabManager.reopenLastClosedTab(existingCount: tabs.count)
 
         case .refresh:
             guard let currentId = tabManager.currentTabId,
@@ -118,7 +163,12 @@ struct ContentView: View {
             }
 
         case .focusURLBar:
-            NotificationCenter.default.post(name: .focusURLBar, object: nil)
+            // Show command palette in navigate mode with current URL
+            let recentTabs = tabs
+                .filter { $0.id != tabManager.currentTabId }
+                .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
+                .prefix(5)
+            commandPaletteState.show(mode: .navigate, currentURL: tabManager.currentTabURL, recentTabs: Array(recentTabs))
 
         case .toggleSidebar:
             toggleDock()
@@ -131,6 +181,55 @@ struct ContentView: View {
 
         case .openSettings:
             tabManager.openSettings()
+
+        case .zoomIn:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.zoomIn()
+
+        case .zoomOut:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.zoomOut()
+
+        case .resetZoom:
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.resetZoom()
+        }
+    }
+
+    func handleCommandPaletteSubmit(_ suggestionType: SuggestionType) {
+        commandPaletteState.hide(saveText: false)
+
+        var urlToLoad: String
+
+        switch suggestionType {
+        case .searchSuggestion(let query):
+            // Search Google
+            let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+            urlToLoad = "https://www.google.com/search?q=\(encoded)"
+
+        case .directURL(let url):
+            urlToLoad = url.lowercased().hasPrefix("http") ? url : "https://\(url)"
+
+        case .historyEntry(_, let url):
+            urlToLoad = url
+
+        case .recentTab(let tab):
+            // Switch to tab instead
+            tabManager.selectTab(tab)
+            return
+        }
+
+        if commandPaletteState.mode == .newTab {
+            // Create new tab with URL
+            tabManager.createTab(url: urlToLoad, existingCount: tabs.count)
+        } else {
+            // Navigate current tab
+            guard let currentId = tabManager.currentTabId,
+                  let state = browserStates[currentId] else { return }
+            state.loadURL(urlToLoad)
         }
     }
 
