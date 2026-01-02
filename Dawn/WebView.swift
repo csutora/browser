@@ -15,12 +15,20 @@ struct WebViewContainer: View {
     var browserStates: [UUID: BrowserState]
     var currentTabId: UUID?
     var isDocked: Bool
+    var isFullscreen: Bool = false
     var sidebarWidth: CGFloat
     var onSettingsNavigate: ((String) -> Void)?
 
     private let defaultColor = Color(NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0))
 
+    // In fullscreen with floating sidebar, no border; otherwise use padding
+    private var shouldHaveBorder: Bool {
+        !(isFullscreen && !isDocked)
+    }
+
     @State private var displayedBackgroundColor: Color = Color(NSColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0))
+    @State private var showStroke: Bool = true
+    @State private var strokeWorkItem: DispatchWorkItem?
 
     // Get cached color from Tab (returns nil if no cached color)
     private func cachedBackgroundColor(for tabId: UUID?) -> Color? {
@@ -53,17 +61,19 @@ struct WebViewContainer: View {
 
     var body: some View {
         GeometryReader { geo in
-            let leadingPadding = isDocked ? sidebarWidth : 8
+            let padding: CGFloat = shouldHaveBorder ? 8 : 0
+            let leadingPadding = isDocked ? sidebarWidth : padding
             let frame = CGRect(
                 x: leadingPadding,
-                y: 8,
-                width: max(0, geo.size.width - leadingPadding - 8),
-                height: max(0, geo.size.height - 16)
+                y: padding,
+                width: max(0, geo.size.width - leadingPadding - padding),
+                height: max(0, geo.size.height - padding * 2)
             )
+            let cornerRadius: CGFloat = shouldHaveBorder ? 9 : 0
 
             ZStack {
                 // Background - uses cached/fetched color
-                RoundedRectangle(cornerRadius: 9)
+                RoundedRectangle(cornerRadius: cornerRadius)
                     .fill(displayedBackgroundColor)
                     .frame(width: frame.width, height: frame.height)
                     .position(x: frame.midX, y: frame.midY)
@@ -82,7 +92,7 @@ struct WebViewContainer: View {
                             }
                         )
                         .frame(width: frame.width, height: frame.height)
-                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
                         .position(x: frame.midX, y: frame.midY)
                     }
                 }
@@ -94,23 +104,44 @@ struct WebViewContainer: View {
                     onNavigate: { path in onSettingsNavigate?(path) }
                 )
                 .frame(width: frame.width, height: frame.height)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
                 .position(x: frame.midX, y: frame.midY)
 
-                // Opaque stroke to cover anti-aliased corner bleeding
-                RoundedRectangle(cornerRadius: 10)
+                // Opaque stroke to cover anti-aliased corner bleeding (delayed appearance)
+                RoundedRectangle(cornerRadius: cornerRadius + 1)
                     .stroke(defaultColor, lineWidth: 2)
                     .frame(width: frame.width + 1, height: frame.height + 1)
                     .position(x: frame.midX, y: frame.midY)
+                    .opacity(showStroke ? 1 : 0)
+                    .animation(.easeIn(duration: 0.15), value: showStroke)
                     .allowsHitTesting(false)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .ignoresSafeArea()
         .animation(.sidebarSpring, value: isDocked)
+        .animation(.sidebarSpring, value: isFullscreen)
+        .onChange(of: shouldHaveBorder) { _, newValue in
+            if newValue {
+                // Delay showing stroke until animation completes
+                strokeWorkItem?.cancel()
+                let workItem = DispatchWorkItem {
+                    showStroke = true
+                }
+                strokeWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
+            } else {
+                // Hide stroke immediately
+                strokeWorkItem?.cancel()
+                strokeWorkItem = nil
+                showStroke = false
+            }
+        }
         .onChange(of: currentTabId) { _, newId in
-            if let cached = cachedBackgroundColor(for: newId) {
+            if let newId = newId, let cached = cachedBackgroundColor(for: newId) {
                 displayedBackgroundColor = cached
+            } else if newId == nil {
+                displayedBackgroundColor = defaultColor
             }
         }
         .onAppear {

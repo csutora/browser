@@ -16,6 +16,7 @@ struct ContentView: View {
 
     @AppStorage("isDocked") private var isDocked: Bool = true
     @AppStorage("sidebarWidth") private var sidebarWidth: Double = 260.0
+    @AppStorage("fullscreenSidebarRadius") private var fullscreenSidebarRadius: Int = 13
 
     @State private var dragStartWidth: Double? = nil
     @State private var isResizing: Bool = false
@@ -25,6 +26,7 @@ struct ContentView: View {
     // Track when floating sidebar is fully open (after animation completes)
     @State private var isSidebarFullyOpen: Bool = false
     @State private var sidebarOpenWorkItem: DispatchWorkItem?
+    @State private var isFullscreen: Bool = false
 
     private let keybindHandler = KeybindHandler.shared
 
@@ -48,6 +50,7 @@ struct ContentView: View {
                 browserStates: browserStates,
                 currentTabId: tabManager.currentTabId,
                 isDocked: isDocked,
+                isFullscreen: isFullscreen,
                 sidebarWidth: CGFloat(sidebarWidth),
                 onSettingsNavigate: { path in
                     tabManager.updateSettingsPath(path)
@@ -95,6 +98,12 @@ struct ContentView: View {
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: newValue)
         }
         .onChange(of: tabs) { _, _ in syncStates() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullscreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
+            isFullscreen = false
+        }
         .onChange(of: isFloatingVisible) { _, newValue in
             if newValue {
                 // Schedule delayed activation (matches animation duration)
@@ -267,20 +276,23 @@ struct ContentView: View {
             isSidebarVisible: isDocked || isFloatingVisible,
             isSidebarFullyOpen: isSidebarFullyOpen,
             onToggle: toggleDock,
+            onNewTab: { handleKeybindAction(.newTab) },
             draggedTab: $draggedTab,
             currentBrowserState: browserStates[tabManager.currentTabId ?? UUID()]
         )
         .frame(width: CGFloat(sidebarWidth))
         .background {
+            let radius = CGFloat(isFullscreen ? fullscreenSidebarRadius : 13)
             ZStack {
-                RoundedRectangle(cornerRadius: 13, style: .continuous).fill(.thinMaterial)
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                RoundedRectangle(cornerRadius: radius, style: .continuous).fill(.thinMaterial)
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(Color(NSColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 0.8)))
                     .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
             }
             .opacity(isDocked ? 0 : 1)
             .padding(isDocked ? 0 : 4)
             .animation(.sidebarSpring.delay(isDocked ? 0.2 : 0), value: isDocked)
+            .animation(.sidebarSpring, value: isFullscreen)
         }
         .shadow(color: .black.opacity(isDocked ? 0 : 0.3), radius: 25, x: 5, y: 10)
         .offset(x: sidebarOffset)

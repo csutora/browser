@@ -31,6 +31,7 @@ struct SidebarView: View {
     var isSidebarVisible: Bool
     var isSidebarFullyOpen: Bool
     var onToggle: () -> Void
+    var onNewTab: () -> Void
     @Binding var draggedTab: Tab?
     var currentBrowserState: BrowserState?
     @State private var urlText = ""
@@ -107,7 +108,7 @@ struct SidebarView: View {
             }
             Spacer(minLength: 0)
             HStack {
-                Button(action: { tabManager.createTab(existingCount: tabs.count) }) { Label("New Tab", systemImage: "plus").font(.system(size: 12)).foregroundColor(.secondary) }.buttonStyle(.plain)
+                Button(action: onNewTab) { Label("New Tab", systemImage: "plus").font(.system(size: 12)).foregroundColor(.secondary) }.buttonStyle(.plain)
                 Spacer()
             }.padding(16).background(SidebarBackgroundHelper())
         }

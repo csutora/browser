@@ -15,6 +15,7 @@ class SettingsNavigationState: ObservableObject {
 struct SettingsView: View {
     @ObservedObject var navigationState: SettingsNavigationState
     @StateObject private var keybindingsManager = KeybindingsManager.shared
+    @AppStorage("fullscreenSidebarRadius") private var fullscreenSidebarRadius: Int = 13
 
     private var showKeybinds: Bool {
         navigationState.currentPath == "keybinds"
@@ -67,6 +68,24 @@ struct SettingsView: View {
                         Text("Google")
                             .foregroundColor(.secondary)
                             .font(.system(size: 13))
+                    }
+                }
+
+                // Appearance Section
+                SettingsSection(title: "Appearance") {
+                    SettingsRow(title: "Fullscreen sidebar radius") {
+                        HStack(spacing: 12) {
+                            Slider(value: Binding(
+                                get: { Double(fullscreenSidebarRadius) },
+                                set: { fullscreenSidebarRadius = Int($0) }
+                            ), in: 0...30, step: 1)
+                            .frame(width: 120)
+
+                            Text("\(fullscreenSidebarRadius)")
+                                .font(.system(size: 13, weight: .medium).monospacedDigit())
+                                .foregroundColor(.secondary)
+                                .frame(width: 24, alignment: .trailing)
+                        }
                     }
                 }
 
