@@ -22,6 +22,10 @@ struct ContentView: View {
     @State private var draggedTab: Tab?
     @State private var useDockAnimation: Bool = false
 
+    // Track when floating sidebar is fully open (after animation completes)
+    @State private var isSidebarFullyOpen: Bool = false
+    @State private var sidebarOpenWorkItem: DispatchWorkItem?
+
     private let keybindHandler = KeybindHandler.shared
 
     var isFloatingVisible: Bool {
@@ -91,6 +95,22 @@ struct ContentView: View {
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: newValue)
         }
         .onChange(of: tabs) { _, _ in syncStates() }
+        .onChange(of: isFloatingVisible) { _, newValue in
+            if newValue {
+                // Schedule delayed activation (matches animation duration)
+                sidebarOpenWorkItem?.cancel()
+                let workItem = DispatchWorkItem { [self] in
+                    isSidebarFullyOpen = true
+                }
+                sidebarOpenWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
+            } else {
+                // Cancel pending and immediately deactivate
+                sidebarOpenWorkItem?.cancel()
+                sidebarOpenWorkItem = nil
+                isSidebarFullyOpen = false
+            }
+        }
     }
 
     func setupKeybindHandler() {
@@ -245,6 +265,7 @@ struct ContentView: View {
             tabs: tabs,
             isDocked: isDocked,
             isSidebarVisible: isDocked || isFloatingVisible,
+            isSidebarFullyOpen: isSidebarFullyOpen,
             onToggle: toggleDock,
             draggedTab: $draggedTab,
             currentBrowserState: browserStates[tabManager.currentTabId ?? UUID()]

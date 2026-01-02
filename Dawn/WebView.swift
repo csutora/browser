@@ -215,4 +215,3 @@ struct HiddenControlView<Content: View>: NSViewRepresentable {
         nsView.isHidden = !isVisible
     }
 }
-

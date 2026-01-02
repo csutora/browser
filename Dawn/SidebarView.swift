@@ -29,6 +29,7 @@ struct SidebarView: View {
     var tabs: [Tab]
     var isDocked: Bool
     var isSidebarVisible: Bool
+    var isSidebarFullyOpen: Bool
     var onToggle: () -> Void
     @Binding var draggedTab: Tab?
     var currentBrowserState: BrowserState?
@@ -39,7 +40,7 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 HStack(spacing: 8) {
-                    TrafficLightsView(isSidebarVisible: isSidebarVisible, isDocked: isDocked)
+                    TrafficLightsView(isDocked: isDocked, isSidebarFullyOpen: isSidebarFullyOpen)
                     Button(action: onToggle) {
                         Image(systemName: "sidebar.left")
                             .font(.system(size: 12, weight: .medium))
