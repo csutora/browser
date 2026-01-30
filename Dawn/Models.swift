@@ -45,6 +45,12 @@ final class Tab: Identifiable {
     }
 }
 
+extension Tab: Equatable {
+    static func == (lhs: Tab, rhs: Tab) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
 // MARK: - Closed Tab Info (for reopen stack)
 struct ClosedTabInfo {
     let title: String

@@ -229,6 +229,8 @@ struct ContentView: View {
     }
 
     func handleCommandPaletteSubmit(_ suggestionType: SuggestionType) {
+        // Capture mode before hiding (in case hide() is later modified to reset mode)
+        let mode = commandPaletteState.mode
         commandPaletteState.hide(saveText: false)
 
         var urlToLoad: String
@@ -242,6 +244,10 @@ struct ContentView: View {
         case .directURL(let url):
             urlToLoad = url.lowercased().hasPrefix("http") ? url : "https://\(url)"
 
+        case .dnsResolved(let hostname):
+            // Single word that resolved via DNS (e.g., MagicDNS, intranet)
+            urlToLoad = "http://\(hostname)"
+
         case .historyEntry(_, let url):
             urlToLoad = url
 
@@ -251,7 +257,7 @@ struct ContentView: View {
             return
         }
 
-        if commandPaletteState.mode == .newTab {
+        if mode == .newTab {
             // Create new tab with URL
             tabManager.createTab(url: urlToLoad, existingCount: tabs.count)
         } else {

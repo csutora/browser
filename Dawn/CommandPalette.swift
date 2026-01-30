@@ -7,15 +7,23 @@ enum CommandPaletteMode {
     case navigate    // cmd+l - navigates current tab, pre-fills current URL
 }
 
+// MARK: - Input Classification
+enum InputType {
+    case url           // Definitely a URL - show "Go to website"
+    case search        // Definitely a search query
+    case singleWord    // Single word without dots - needs DNS check
+}
+
 // MARK: - Suggestion Types
-enum SuggestionType {
+enum SuggestionType: Equatable {
     case recentTab(Tab)
     case searchSuggestion(String)
     case historyEntry(String, String) // title, url - placeholder for future
     case directURL(String)
+    case dnsResolved(String)  // Single word that resolved via DNS
 }
 
-struct Suggestion: Identifiable {
+struct Suggestion: Identifiable, Equatable {
     let id = UUID()
     let type: SuggestionType
     let displayText: String
@@ -26,8 +34,14 @@ struct Suggestion: Identifiable {
         case .recentTab: return "square.on.square"
         case .searchSuggestion: return "magnifyingglass"
         case .historyEntry: return "clock"
-        case .directURL: return "globe"
+        case .directURL, .dnsResolved: return "globe"
         }
+    }
+
+    static func == (lhs: Suggestion, rhs: Suggestion) -> Bool {
+        lhs.type == rhs.type &&
+        lhs.displayText == rhs.displayText &&
+        lhs.secondaryText == rhs.secondaryText
     }
 }
 
@@ -36,12 +50,16 @@ class CommandPaletteState: ObservableObject {
     @Published var isVisible: Bool = false
     @Published var mode: CommandPaletteMode = .newTab
     @Published var inputText: String = ""           // What user actually typed
-    @Published var completionText: String = ""      // Suggested completion (highlighted/selected)
+    @Published var completionText: String = ""      // Suggested completion (for congruent suggestions)
+    @Published var previewText: String = ""         // Full text for non-congruent suggestion preview
     @Published var selectedIndex: Int = 0
     @Published var suggestions: [Suggestion] = []
 
-    // Display text = inputText + completionText
-    var displayText: String { inputText + completionText }
+    // Display text: preview if set, otherwise input + completion
+    var displayText: String {
+        if !previewText.isEmpty { return previewText }
+        return inputText + completionText
+    }
 
     // For newTab mode - keep text for 30 seconds
     private var lastNewTabText: String = ""
@@ -50,21 +68,125 @@ class CommandPaletteState: ObservableObject {
 
     // Search suggestions from Google
     private var googleSuggestions: [String] = []
+    private var googleSuggestionsQuery: String = ""  // The query these suggestions are for
     private var searchTask: Task<Void, Never>?
-    private var searchDebounceTask: DispatchWorkItem?
+
+    // DNS resolution for single words
+    private var dnsResolvedHost: String?
+    private var pendingDNSQuery: String?
 
     // Track typing direction
     private var isTypingForward: Bool = true
 
+    // Track if completion was just accepted (for cursor positioning)
+    @Published var completionJustAccepted: Bool = false
+
+    // Show exact match suggestion at top (triggered by backspace, hidden by appending to end)
+    private var showExactMatch: Bool = false
+
     // Recent tabs reference
     var recentTabs: [Tab] = []
+
+    // MARK: - Input Classification
+
+    /// Check if input has any URL scheme (handles http://, https://, dawn://, file://, etc.)
+    private func hasScheme(_ input: String) -> Bool {
+        guard let schemeEnd = input.range(of: "://") else { return false }
+        let scheme = input[..<schemeEnd.lowerBound]
+        guard let first = scheme.first, first.isLetter else { return false }
+        return scheme.dropFirst().allSatisfy {
+            $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "."
+        }
+    }
+
+    func classifyInput(_ text: String) -> InputType {
+        let input = text.trimmingCharacters(in: .whitespaces)
+        guard !input.isEmpty else { return .search }
+
+        // Any scheme (http://, https://, dawn://, file://, etc.) → URL
+        if hasScheme(input) {
+            return .url
+        }
+
+        // Firefox quick rejection: space/quote before first structural char → search
+        if let firstStructural = input.firstIndex(where: { ".:/".contains($0) }) {
+            let prefix = input[..<firstStructural]
+            if prefix.contains(" ") || prefix.contains("\"") || prefix.contains("'") {
+                return .search
+            }
+        } else if input.contains(" ") {
+            return .search
+        }
+
+        // Starts with ? → search
+        if input.hasPrefix("?") { return .search }
+
+        // localhost → URL
+        let lower = input.lowercased()
+        if lower.hasPrefix("localhost") { return .url }
+
+        // IPv4 address → URL
+        if input.range(of: #"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"#, options: .regularExpression) != nil {
+            return .url
+        }
+
+        // IPv6 address → URL
+        if input.hasPrefix("[") && input.contains("]") { return .url }
+
+        // Has port (host:1234) → URL
+        if let colonIdx = input.lastIndex(of: ":") {
+            let afterColon = input[input.index(after: colonIdx)...]
+            if !afterColon.isEmpty && afterColon.allSatisfy({ $0.isNumber }) { return .url }
+        }
+
+        // Trailing slash with dot → URL (user explicitly indicating URL)
+        if input.hasSuffix("/") && input.contains(".") { return .url }
+
+        // No dot = single word → needs DNS check
+        guard input.contains(".") else { return .singleWord }
+
+        // Has dot - check TLD against Public Suffix List
+        let hostPart = String(input.split(separator: "/").first ?? Substring(input))
+        let parts = hostPart.split(separator: ".")
+        guard parts.count >= 2 else { return .search }
+
+        // Check single-part TLD
+        let lastPart = String(parts.last!).lowercased()
+        if PublicSuffixList.shared.isValidSuffix(lastPart) {
+            return .url
+        }
+
+        // Check two-part TLD (e.g., .co.uk)
+        if parts.count >= 2 {
+            let twoPartTLD = "\(parts[parts.count - 2]).\(parts[parts.count - 1])".lowercased()
+            if PublicSuffixList.shared.isValidSuffix(twoPartTLD) {
+                return .url
+            }
+        }
+
+        // Check if domain has valid TLD
+        if PublicSuffixList.shared.hasValidTLD(hostPart) {
+            return .url
+        }
+
+        // Unknown TLD → treat as search
+        return .search
+    }
+
+    // MARK: - Public Methods
 
     func show(mode: CommandPaletteMode, currentURL: String? = nil, recentTabs: [Tab]) {
         self.mode = mode
         self.recentTabs = recentTabs
         self.googleSuggestions = []
+        self.googleSuggestionsQuery = ""
         self.completionText = ""
+        self.previewText = ""
         self.isTypingForward = true
+        self.dnsResolvedHost = nil
+        self.pendingDNSQuery = nil
+        self.completionJustAccepted = false
+        self.showExactMatch = false
 
         switch mode {
         case .newTab:
@@ -92,20 +214,44 @@ class CommandPaletteState: ObservableObject {
         }
         isVisible = false
         searchTask?.cancel()
-        searchDebounceTask?.cancel()
+    }
+
+    /// Check if suggestions are relevant to current input
+    private func suggestionsAreRelevant() -> Bool {
+        guard !googleSuggestions.isEmpty, !inputText.isEmpty else { return false }
+        let inputLower = inputText.lowercased()
+        let queryLower = googleSuggestionsQuery.lowercased()
+
+        // Suggestions are relevant if:
+        // 1. Current input starts with the query that fetched these suggestions, OR
+        // 2. The query starts with current input (user deleted some chars)
+        return inputLower.hasPrefix(queryLower) || queryLower.hasPrefix(inputLower)
     }
 
     /// Called when text field content changes
-    func handleTextChange(newDisplayText: String, selectionWasAtEnd: Bool) {
+    func handleTextChange(newDisplayText: String) {
+        // If we had a preview, commit it on any text change
+        if !previewText.isEmpty {
+            // User is editing - commit the preview as the new input base
+            inputText = previewText
+            previewText = ""
+        }
+
         let oldInput = inputText
         let oldCompletion = completionText
 
+        // Reset completion accepted flag
+        completionJustAccepted = false
+
+        // Determine if this is an append to the end (for showExactMatch logic)
+        let isAppendToEnd = newDisplayText.hasPrefix(oldInput) && newDisplayText.count > oldInput.count
+
         // Case 1: User cleared the completion (backspace with selection)
         if newDisplayText == oldInput && !oldCompletion.isEmpty {
-            // Completion was deleted, input stays the same
             completionText = ""
             isTypingForward = false
-            // First option should now be exact query
+            selectedIndex = 0
+            showExactMatch = true  // Backspace triggers exact match
             rebuildSuggestions()
             return
         }
@@ -114,27 +260,57 @@ class CommandPaletteState: ObservableObject {
         if newDisplayText.count < oldInput.count {
             inputText = newDisplayText
             completionText = ""
+            previewText = ""
             isTypingForward = false
+            selectedIndex = 0
+            showExactMatch = !newDisplayText.isEmpty  // Show exact match on backspace (if not empty)
+
+            // Clear suggestions if they're no longer relevant
+            if !suggestionsAreRelevant() {
+                googleSuggestions = []
+                googleSuggestionsQuery = ""
+            }
+
             rebuildSuggestions()
-            fetchGoogleSuggestionsImmediate(for: newDisplayText)
+
+            if !newDisplayText.isEmpty {
+                fetchGoogleSuggestionsDebounced(for: newDisplayText)
+            }
             return
         }
 
         // Case 3: User typed forward (replaces selection if any, or appends)
         if newDisplayText.count > oldInput.count || (newDisplayText != oldInput && newDisplayText.count == oldInput.count) {
-            // User typed - the new display text is the new input
             inputText = newDisplayText
             completionText = ""
+            previewText = ""
             isTypingForward = true
+            selectedIndex = 0
+
+            // Update showExactMatch: hide if appending to end, keep if editing middle
+            if isAppendToEnd {
+                showExactMatch = false
+            }
+            // else: editing in middle - keep showExactMatch as is
+
+            // Clear suggestions if they're no longer relevant
+            if !suggestionsAreRelevant() {
+                googleSuggestions = []
+                googleSuggestionsQuery = ""
+            }
+
             rebuildSuggestions()
 
-            // Fetch suggestions
-            let hasMatchingSuggestion = googleSuggestions.contains {
+            // Fetch suggestions if we have fewer than 5 matching ones
+            let matchingCount = googleSuggestions.filter {
                 $0.lowercased().hasPrefix(newDisplayText.lowercased()) && $0.lowercased() != newDisplayText.lowercased()
+            }.count
+            if matchingCount < 5 {
+                fetchGoogleSuggestionsDebounced(for: newDisplayText)
             }
-            if !hasMatchingSuggestion {
-                fetchGoogleSuggestionsImmediate(for: newDisplayText)
-            }
+
+            // Check for DNS resolution on single words
+            checkDNSResolution(for: newDisplayText)
             return
         }
 
@@ -142,38 +318,94 @@ class CommandPaletteState: ObservableObject {
         if newDisplayText.isEmpty {
             inputText = ""
             completionText = ""
+            previewText = ""
             googleSuggestions = []
+            googleSuggestionsQuery = ""
             isTypingForward = true
             selectedIndex = 0
+            showExactMatch = false
+            dnsResolvedHost = nil
             rebuildSuggestions()
         }
     }
 
-    /// Accept the current completion as actual input
+    /// Accept the current completion/preview as actual input
     func acceptCompletion() {
-        guard !completionText.isEmpty else { return }
-        inputText = inputText + completionText
-        completionText = ""
-        isTypingForward = true
-        rebuildSuggestions()
+        if !previewText.isEmpty {
+            // Accept preview
+            inputText = previewText
+            previewText = ""
+            completionText = ""
+            completionJustAccepted = true
+            isTypingForward = false  // Don't auto-extend further after accepting
+            showExactMatch = true    // Show exact match at top (same as backspace behavior)
+            rebuildSuggestions()
+        } else if !completionText.isEmpty {
+            // Accept completion
+            inputText = inputText + completionText
+            completionText = ""
+            completionJustAccepted = true
+            isTypingForward = false  // Don't auto-extend further after accepting
+            showExactMatch = true    // Show exact match at top (same as backspace behavior)
+            rebuildSuggestions()
+        }
     }
 
     func moveSelection(by delta: Int) {
         guard !suggestions.isEmpty else { return }
         selectedIndex = (selectedIndex + delta + suggestions.count) % suggestions.count
-        updateCompletion()
+        updateDisplayForSelection()
     }
 
     func selectCurrent() -> SuggestionType? {
+        // If we have a preview, use that for submission
+        if !previewText.isEmpty {
+            // Find the suggestion that matches the preview
+            if let suggestion = suggestions.first(where: { $0.displayText == previewText }) {
+                return suggestion.type
+            }
+        }
         guard selectedIndex < suggestions.count else { return nil }
         return suggestions[selectedIndex].type
+    }
+
+    // MARK: - DNS Resolution
+
+    private func checkDNSResolution(for query: String) {
+        // Only check single words (no dots, no spaces)
+        guard !query.contains(".") && !query.contains(" ") && query.count >= 2 else {
+            return
+        }
+
+        // Don't re-check if we already have this resolved
+        if dnsResolvedHost == query {
+            return
+        }
+
+        // Cancel any pending DNS check
+        pendingDNSQuery = query
+
+        DNSResolver.resolveInBackground(query, timeout: 2.0) { [weak self] resolved, hostname in
+            guard let self = self else { return }
+            // Only update if this is still the current query
+            guard self.pendingDNSQuery == query, self.inputText == query else { return }
+
+            if resolved, let host = hostname {
+                self.dnsResolvedHost = host
+                self.rebuildSuggestions()
+            }
+        }
     }
 
     // MARK: - Suggestions Logic
 
     private func rebuildSuggestions() {
+        // Always clear completion/preview when rebuilding from scratch
+        completionText = ""
+        previewText = ""
+
         if inputText.isEmpty {
-            // Show recent tabs
+            // Show recent tabs when empty
             suggestions = recentTabs.prefix(5).map { tab in
                 Suggestion(
                     type: .recentTab(tab),
@@ -181,73 +413,72 @@ class CommandPaletteState: ObservableObject {
                     secondaryText: cleanURLForDisplay(tab.url)
                 )
             }
-            completionText = ""
             return
         }
 
         let query = inputText
         let queryLower = query.lowercased()
-        let isLikelyURL = query.contains(".") && !query.contains(" ")
+        let inputType = classifyInput(query)
 
         var newSuggestions: [Suggestion] = []
 
-        // Find suggestions that are continuations of the input
-        let continuations = googleSuggestions.filter {
-            $0.lowercased().hasPrefix(queryLower) && $0.lowercased() != queryLower
-        }
-
-        // Exact query suggestion
-        let exactSuggestion: Suggestion
-        if isLikelyURL {
-            exactSuggestion = Suggestion(
+        // For URLs: show direct URL option first, no inline completion
+        if inputType == .url {
+            newSuggestions.append(Suggestion(
                 type: .directURL(query),
                 displayText: query,
                 secondaryText: "Go to website"
-            )
-        } else {
-            exactSuggestion = Suggestion(
+            ))
+
+            // Add Google suggestions below (but don't auto-complete with them)
+            for suggestion in googleSuggestions {
+                newSuggestions.append(Suggestion(
+                    type: .searchSuggestion(suggestion),
+                    displayText: suggestion,
+                    secondaryText: nil
+                ))
+            }
+
+            suggestions = newSuggestions
+
+            // Keep selection in bounds
+            if selectedIndex >= suggestions.count {
+                selectedIndex = 0
+            }
+            return
+        }
+
+        // For single words: check if DNS resolved
+        if inputType == .singleWord {
+            // If DNS resolved, show "Go to X" option
+            if dnsResolvedHost == query {
+                newSuggestions.append(Suggestion(
+                    type: .dnsResolved(query),
+                    displayText: query,
+                    secondaryText: "Go to \(query)"
+                ))
+            }
+        }
+
+        // Find suggestions that are continuations of the input
+        let continuations = googleSuggestions.filter { suggestion in
+            let lower = suggestion.lowercased()
+            return lower.hasPrefix(queryLower) && lower != queryLower
+        }
+
+        // Show exact match at top when:
+        // 1. Triggered by backspace (showExactMatch), OR
+        // 2. No suggestions available (so there's always something to select)
+        if showExactMatch || continuations.isEmpty {
+            newSuggestions.append(Suggestion(
                 type: .searchSuggestion(query),
                 displayText: query,
-                secondaryText: "Search Google"
-            )
-        }
-
-        // First option depends on typing direction:
-        // - Typing forward: best continuation (if any), otherwise exact
-        // - Deleting: always exact query first
-        if isTypingForward, let bestContinuation = continuations.first {
-            newSuggestions.append(Suggestion(
-                type: .searchSuggestion(bestContinuation),
-                displayText: bestContinuation,
                 secondaryText: nil
             ))
-            // Add remaining continuations
-            for suggestion in continuations.dropFirst().prefix(3) {
-                newSuggestions.append(Suggestion(
-                    type: .searchSuggestion(suggestion),
-                    displayText: suggestion,
-                    secondaryText: nil
-                ))
-            }
-        } else {
-            // Not typing forward or no continuations - exact query first
-            newSuggestions.append(exactSuggestion)
-            // Add continuations after exact
-            for suggestion in continuations.prefix(3) {
-                newSuggestions.append(Suggestion(
-                    type: .searchSuggestion(suggestion),
-                    displayText: suggestion,
-                    secondaryText: nil
-                ))
-            }
         }
 
-        // Add non-continuation suggestions (fill up to 5 total)
-        let nonContinuations = googleSuggestions.filter {
-            !$0.lowercased().hasPrefix(queryLower)
-        }
-        let remainingSlots = max(0, 5 - newSuggestions.count)
-        for suggestion in nonContinuations.prefix(remainingSlots) {
+        // Add continuations
+        for suggestion in continuations {
             newSuggestions.append(Suggestion(
                 type: .searchSuggestion(suggestion),
                 displayText: suggestion,
@@ -255,21 +486,23 @@ class CommandPaletteState: ObservableObject {
             ))
         }
 
-        // Limit to 5 suggestions
-        suggestions = Array(newSuggestions.prefix(5))
+        suggestions = newSuggestions
 
         // Keep selection in bounds
         if selectedIndex >= suggestions.count {
-            selectedIndex = 0
+            selectedIndex = max(0, suggestions.count - 1)
         }
 
-        updateCompletion()
+        // Update completion text for first suggestion if typing forward
+        if isTypingForward && selectedIndex < suggestions.count {
+            updateDisplayForSelection()
+        }
     }
 
-    private func updateCompletion() {
-        // Only show completion when typing forward
-        guard isTypingForward, !inputText.isEmpty, selectedIndex < suggestions.count else {
+    private func updateDisplayForSelection() {
+        guard !inputText.isEmpty, selectedIndex < suggestions.count else {
             completionText = ""
+            previewText = ""
             return
         }
 
@@ -277,26 +510,39 @@ class CommandPaletteState: ObservableObject {
         let suggestionLower = suggestion.displayText.lowercased()
         let inputLower = inputText.lowercased()
 
-        // Only show completion if suggestion is a continuation of input
-        if suggestionLower.hasPrefix(inputLower) && suggestionLower != inputLower {
+        if suggestionLower == inputLower {
+            // Exact match - no completion or preview needed
+            previewText = ""
+            completionText = ""
+        } else if suggestionLower.hasPrefix(inputLower) {
+            // Congruent - use completion mechanism
+            previewText = ""
             completionText = String(suggestion.displayText.dropFirst(inputText.count))
         } else {
+            // Non-congruent - show full preview
             completionText = ""
+            previewText = suggestion.displayText
         }
     }
 
     // MARK: - Google Suggestions Fetching
 
-    private func fetchGoogleSuggestionsImmediate(for query: String) {
+    private func fetchGoogleSuggestionsDebounced(for query: String) {
         guard !query.isEmpty else { return }
         searchTask?.cancel()
         let currentQuery = query
 
         searchTask = Task { @MainActor in
+            // Small debounce
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+
+            guard !Task.isCancelled, self.inputText == currentQuery else { return }
+
             do {
                 let results = try await fetchFromGoogle(query: query)
                 guard self.inputText == currentQuery else { return }
                 self.googleSuggestions = results
+                self.googleSuggestionsQuery = currentQuery
                 self.rebuildSuggestions()
             } catch {
                 // Keep existing suggestions on error
@@ -339,8 +585,15 @@ struct CommandPaletteView: View {
     let onDismiss: () -> Void
 
     @State private var keyMonitor: Any?
+    @State private var scrollProxy: ScrollViewProxy?
+    @State private var visibleRange: Range<Int> = 0..<5
 
-    private let paletteHeightWith5Items: CGFloat = 273
+    private let rowHeight: CGFloat = 44
+    private let visibleRows: Int = 5
+    private var maxSuggestionsHeight: CGFloat { CGFloat(visibleRows) * rowHeight }
+
+    // Fixed height for 5 rows - used for positioning
+    private var fixedPaletteHeight: CGFloat { 56 + 1 + maxSuggestionsHeight + 16 }
 
     var body: some View {
         GeometryReader { geometry in
@@ -351,26 +604,34 @@ struct CommandPaletteView: View {
                     .onTapGesture { onDismiss() }
                     .ignoresSafeArea()
 
-                let topOffset = (geometry.size.height - paletteHeightWith5Items) / 2
+                // Calculate top offset based on FIXED 5-row height (for consistent positioning)
+                let topOffset = (geometry.size.height - fixedPaletteHeight) / 2
+
+                // Actual content height based on current suggestions
+                let actualSuggestionsHeight = min(maxSuggestionsHeight, CGFloat(state.suggestions.count) * rowHeight)
+                let showSuggestions = !state.suggestions.isEmpty
 
                 VStack(spacing: 0) {
                     // Input field
                     AutocompleteTextField(
                         inputText: $state.inputText,
                         completionText: $state.completionText,
+                        previewText: $state.previewText,
+                        completionJustAccepted: $state.completionJustAccepted,
                         onTextChange: { newText in
-                            state.handleTextChange(newDisplayText: newText, selectionWasAtEnd: true)
+                            state.handleTextChange(newDisplayText: newText)
                         },
                         selectAllOnAppear: state.mode == .navigate
                     )
                     .frame(height: 56)
                     .padding(.horizontal, 16)
 
-                    if !state.suggestions.isEmpty {
+                    if showSuggestions {
                         Divider()
                             .background(Color.white.opacity(0.1))
 
                         suggestionsListView
+                            .frame(height: actualSuggestionsHeight)
                             .padding(.vertical, 8)
                     }
                 }
@@ -404,15 +665,17 @@ struct CommandPaletteView: View {
                 return nil
             case 0x7E: // Arrow Up
                 state.moveSelection(by: -1)
+                scrollToSelectionIfNeeded()
                 return nil
             case 0x7D: // Arrow Down
                 state.moveSelection(by: 1)
+                scrollToSelectionIfNeeded()
                 return nil
-            case 0x30: // Tab
+            case 0x30: // Tab - accept completion/preview
                 state.acceptCompletion()
                 return nil
-            case 0x7C: // Right Arrow - accept completion
-                if !state.completionText.isEmpty {
+            case 0x7C: // Right Arrow - accept completion if at end
+                if !state.completionText.isEmpty || !state.previewText.isEmpty {
                     state.acceptCompletion()
                     return nil
                 }
@@ -426,6 +689,32 @@ struct CommandPaletteView: View {
         }
     }
 
+    /// Only scroll if the selected item is outside the visible range
+    private func scrollToSelectionIfNeeded() {
+        guard let proxy = scrollProxy,
+              state.selectedIndex < state.suggestions.count,
+              state.suggestions.count > visibleRows else { return }
+
+        let idx = state.selectedIndex
+
+        // Only scroll if selection is outside visible range
+        if idx < visibleRange.lowerBound || idx >= visibleRange.upperBound {
+            // Determine anchor based on direction
+            let anchor: UnitPoint
+            if idx < visibleRange.lowerBound {
+                anchor = .top
+                visibleRange = idx..<(idx + visibleRows)
+            } else {
+                anchor = .bottom
+                visibleRange = (idx - visibleRows + 1)..<(idx + 1)
+            }
+
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo(state.suggestions[idx].id, anchor: anchor)
+            }
+        }
+    }
+
     private func removeKeyMonitor() {
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
@@ -434,13 +723,26 @@ struct CommandPaletteView: View {
     }
 
     private var suggestionsListView: some View {
-        VStack(spacing: 0) {
-            ForEach(Array(state.suggestions.enumerated()), id: \.element.id) { index, suggestion in
-                SuggestionRowView(suggestion: suggestion, isSelected: index == state.selectedIndex)
-                    .onTapGesture {
-                        state.selectedIndex = index
-                        handleSubmit()
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(state.suggestions.enumerated()), id: \.element.id) { index, suggestion in
+                        SuggestionRowView(suggestion: suggestion, isSelected: index == state.selectedIndex)
+                            .id(suggestion.id)
+                            .onTapGesture {
+                                state.selectedIndex = index
+                                handleSubmit()
+                            }
                     }
+                }
+            }
+            .scrollIndicators(.hidden)
+            .onAppear {
+                scrollProxy = proxy
+                visibleRange = 0..<min(visibleRows, state.suggestions.count)
+            }
+            .onChange(of: state.suggestions.count) { _, newCount in
+                visibleRange = 0..<min(visibleRows, newCount)
             }
         }
     }
@@ -510,10 +812,12 @@ struct SuggestionRowView: View {
     }
 }
 
-// MARK: - Autocomplete TextField with Selection
+// MARK: - Autocomplete TextField with Selection and Preview
 struct AutocompleteTextField: NSViewRepresentable {
     @Binding var inputText: String
     @Binding var completionText: String
+    @Binding var previewText: String
+    @Binding var completionJustAccepted: Bool
     let onTextChange: (String) -> Void
     let selectAllOnAppear: Bool
 
@@ -544,23 +848,56 @@ struct AutocompleteTextField: NSViewRepresentable {
     }
 
     private func updateTextField(_ textField: NSTextField, context: Context, isInitial: Bool) {
-        let fullText = inputText + completionText
         let coordinator = context.coordinator
 
         // Avoid recursive updates
         guard !coordinator.isUpdating else { return }
 
-        if textField.stringValue != fullText {
-            coordinator.isUpdating = true
-            textField.stringValue = fullText
+        // Determine what text to display
+        let displayText: String
+        let selectionStart: Int
+        let selectionLength: Int
 
-            // Set selection on the completion part
-            if !completionText.isEmpty, let fieldEditor = textField.currentEditor() as? NSTextView {
-                let selectionStart = inputText.count
-                let selectionLength = completionText.count
-                fieldEditor.setSelectedRange(NSRange(location: selectionStart, length: selectionLength))
-            } else if isInitial && selectAllOnAppear && !inputText.isEmpty {
-                textField.selectText(nil)
+        if !previewText.isEmpty {
+            // Preview mode: show full preview text, cursor at end (no selection)
+            displayText = previewText
+            selectionStart = previewText.count
+            selectionLength = 0
+        } else {
+            // Normal mode: input + completion (completion part is selected)
+            displayText = inputText + completionText
+            selectionStart = inputText.count
+            selectionLength = completionText.count
+        }
+
+        // Check if we need to update
+        let needsTextUpdate = textField.stringValue != displayText
+        let needsCursorUpdate = completionJustAccepted
+
+        if needsTextUpdate || needsCursorUpdate {
+            coordinator.isUpdating = true
+
+            if needsTextUpdate {
+                textField.stringValue = displayText
+            }
+
+            if let fieldEditor = textField.currentEditor() as? NSTextView {
+                if completionJustAccepted {
+                    // Completion was accepted - move cursor to end
+                    fieldEditor.setSelectedRange(NSRange(location: displayText.count, length: 0))
+                    // Reset the flag synchronously
+                    DispatchQueue.main.async {
+                        self.completionJustAccepted = false
+                    }
+                } else if selectionLength > 0 {
+                    // Set selection on completion part only
+                    fieldEditor.setSelectedRange(NSRange(location: selectionStart, length: selectionLength))
+                } else if isInitial && selectAllOnAppear && !inputText.isEmpty {
+                    textField.selectText(nil)
+                } else if needsTextUpdate && previewText.isEmpty && completionText.isEmpty {
+                    // Text changed but no completion - keep cursor at end
+                    fieldEditor.setSelectedRange(NSRange(location: displayText.count, length: 0))
+                }
             }
 
             coordinator.isUpdating = false
@@ -583,7 +920,11 @@ struct AutocompleteTextField: NSViewRepresentable {
         func controlTextDidChange(_ obj: Notification) {
             guard !isUpdating, let textField = obj.object as? NSTextField else { return }
 
+            // Process synchronously to avoid race conditions
+            isUpdating = true
             let newText = textField.stringValue
+            isUpdating = false
+
             parent.onTextChange(newText)
         }
     }
