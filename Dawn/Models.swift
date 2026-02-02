@@ -52,12 +52,13 @@ extension Tab: Equatable {
 }
 
 // MARK: - Closed Tab Info (for reopen stack)
-struct ClosedTabInfo {
+struct ClosedTabInfo: Codable {
     let title: String
     let url: String
     let sortIndex: Int
     let tabType: TabType
     let backgroundColorHex: String?
+    let interactionState: Data?  // Navigation state (back/forward history)
 }
 
 // MARK: - Tab Manager
@@ -67,8 +68,28 @@ class TabManager: ObservableObject {
     private var saveTask: DispatchWorkItem?
 
     /// Stack of recently closed tabs (most recent last)
-    private var closedTabsStack: [ClosedTabInfo] = []
+    private var closedTabsStack: [ClosedTabInfo] = [] {
+        didSet { saveClosedTabsStack() }
+    }
     private let maxClosedTabs = 20
+    private let closedTabsKey = "closedTabsStack"
+
+    init() {
+        loadClosedTabsStack()
+    }
+
+    private func saveClosedTabsStack() {
+        if let encoded = try? JSONEncoder().encode(closedTabsStack) {
+            UserDefaults.standard.set(encoded, forKey: closedTabsKey)
+        }
+    }
+
+    private func loadClosedTabsStack() {
+        if let data = UserDefaults.standard.data(forKey: closedTabsKey),
+           let decoded = try? JSONDecoder().decode([ClosedTabInfo].self, from: data) {
+            closedTabsStack = decoded
+        }
+    }
 
     var currentTabId: UUID? {
         get { UUID(uuidString: currentTabIdString) }
@@ -102,7 +123,7 @@ class TabManager: ObservableObject {
         try? context.save()
     }
 
-    func closeTab(_ tab: Tab, allTabs: [Tab]) {
+    func closeTab(_ tab: Tab, allTabs: [Tab], interactionState: Data? = nil) {
         guard let context = modelContext else { return }
 
         // Save tab info to closed stack before deleting (skip settings tabs)
@@ -112,7 +133,8 @@ class TabManager: ObservableObject {
                 url: tab.url,
                 sortIndex: tab.sortIndex,
                 tabType: tab.tabType,
-                backgroundColorHex: tab.backgroundColorHex
+                backgroundColorHex: tab.backgroundColorHex,
+                interactionState: interactionState
             )
             closedTabsStack.append(closedInfo)
             // Limit stack size
@@ -147,6 +169,7 @@ class TabManager: ObservableObject {
             tabType: closedInfo.tabType
         )
         tab.backgroundColorHex = closedInfo.backgroundColorHex
+        tab.interactionState = closedInfo.interactionState
 
         context.insert(tab)
         currentTabId = tab.id
@@ -222,13 +245,18 @@ class TabManager: ObservableObject {
 
 // MARK: - Browser State
 class BrowserState: ObservableObject {
-    let webPage = WebPage()
+    let webPage: WebPage
     let tabId: UUID
     weak var tabManager: TabManager?
+    weak var historyManager: HistoryManager?
 
     private var pendingURL: URL?
     private var hasLoadedInitialContent = false
     private var lastStyledURL: URL?
+    private var lastRecordedURL: String?
+
+    // Modern Safari User-Agent for website compatibility
+    private static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15"
 
     // Published properties for UI bindings
     @Published var canGoBack = false
@@ -242,10 +270,18 @@ class BrowserState: ObservableObject {
     private let maxZoom: Double = 3.0
     private let zoomStep: Double = 0.1
 
-    init(tabId: UUID, tabManager: TabManager, initialURL: URL?) {
+    private var pendingInteractionState: Data?
+
+    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
+        self.webPage = WebPage()
         self.tabId = tabId
         self.tabManager = tabManager
+        self.historyManager = historyManager
         self.pendingURL = initialURL
+        self.pendingInteractionState = interactionState
+
+        // Set custom User-Agent so websites treat this as modern Safari
+        self.webPage.customUserAgent = Self.safariUserAgent
     }
 
     // MARK: - Event Handlers (called from SwiftUI onChange)
@@ -253,26 +289,43 @@ class BrowserState: ObservableObject {
     func handleURLChange(_ newURL: URL?) {
         guard let url = newURL else { return }
         tabManager?.updateTab(tabId, url: url.absoluteString)
+        // Update navigation state immediately and again after a short delay
+        // (backForwardList may not be updated synchronously)
         updateNavigationState()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(100))
+            self.updateNavigationState()
+        }
     }
 
     func handleTitleChange(_ newTitle: String) {
         guard !newTitle.isEmpty else { return }
         tabManager?.updateTab(tabId, title: newTitle)
+
+        // Record to history when title is available (indicates page loaded)
+        if let url = webPage.url,
+           !url.absoluteString.hasPrefix("dawn://"),
+           url.absoluteString != lastRecordedURL {
+            lastRecordedURL = url.absoluteString
+            historyManager?.recordVisit(title: newTitle, url: url.absoluteString)
+        }
     }
 
     func handleLoadingChange(_ loading: Bool) {
         isLoading = loading
 
+        // Always update navigation state when loading state changes
+        updateNavigationState()
+
         // Fetch background color when loading finishes
         if !loading, let url = webPage.url, url != lastStyledURL {
             lastStyledURL = url
-            updateNavigationState()
 
             Task { @MainActor in
-                // Delay to ensure CSS is fully applied
+                // Delay to ensure CSS is fully applied and navigation state is stable
                 try? await Task.sleep(for: .milliseconds(500))
                 self.fetchBackgroundColor()
+                self.updateNavigationState()
             }
         }
     }
@@ -328,14 +381,21 @@ class BrowserState: ObservableObject {
 
     func loadInitialContentIfNeeded() {
         // Only load once per BrowserState lifetime
-        guard !hasLoadedInitialContent, let url = pendingURL else { return }
+        guard !hasLoadedInitialContent else { return }
         hasLoadedInitialContent = true
-        webPage.load(URLRequest(url: url))
+
+        // Note: interactionState restoration would require accessing the underlying WKWebView
+        // For now, just load the URL
+        if let url = pendingURL {
+            webPage.load(URLRequest(url: url))
+        }
+        pendingInteractionState = nil
     }
 
     func loadURL(_ s: String) {
         var urlString = s
-        if !urlString.lowercased().hasPrefix("http") {
+        // Don't prepend https:// if any protocol already exists
+        if !urlString.contains("://") {
             urlString = "https://" + urlString
         }
         guard let url = URL(string: urlString) else { return }
@@ -345,11 +405,19 @@ class BrowserState: ObservableObject {
     func goBack() {
         guard let item = webPage.backForwardList.backList.last else { return }
         webPage.load(item)
+        // Update navigation state immediately for responsive UI
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.updateNavigationState()
+        }
     }
 
     func goForward() {
         guard let item = webPage.backForwardList.forwardList.first else { return }
         webPage.load(item)
+        // Update navigation state immediately for responsive UI
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.updateNavigationState()
+        }
     }
 
     func reload() {
@@ -359,6 +427,12 @@ class BrowserState: ObservableObject {
 
     func stopLoading() {
         webPage.stopLoading()
+    }
+
+    func captureInteractionState() -> Data? {
+        // Note: interactionState is on WKWebView, not exposed through SwiftUI WebPage wrapper
+        // This would require accessing the underlying WKWebView to implement fully
+        return nil
     }
 
     // MARK: - Zoom

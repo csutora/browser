@@ -55,6 +55,10 @@ class CommandPaletteState: ObservableObject {
     @Published var selectedIndex: Int = 0
     @Published var suggestions: [Suggestion] = []
 
+    // Settings for suggestions
+    @AppStorage("includeSearchSuggestions") private var includeSearchSuggestions: Bool = true
+    @AppStorage("includeHistorySuggestions") private var includeHistorySuggestions: Bool = true
+
     // Display text: preview if set, otherwise input + completion
     var displayText: String {
         if !previewText.isEmpty { return previewText }
@@ -70,6 +74,10 @@ class CommandPaletteState: ObservableObject {
     private var googleSuggestions: [String] = []
     private var googleSuggestionsQuery: String = ""  // The query these suggestions are for
     private var searchTask: Task<Void, Never>?
+
+    // History suggestions
+    var historyManager: HistoryManager?
+    private var historyResults: [HistoryEntry] = []
 
     // DNS resolution for single words
     private var dnsResolvedHost: String?
@@ -180,6 +188,7 @@ class CommandPaletteState: ObservableObject {
         self.recentTabs = recentTabs
         self.googleSuggestions = []
         self.googleSuggestionsQuery = ""
+        self.historyResults = []
         self.completionText = ""
         self.previewText = ""
         self.isTypingForward = true
@@ -275,6 +284,7 @@ class CommandPaletteState: ObservableObject {
 
             if !newDisplayText.isEmpty {
                 fetchGoogleSuggestionsDebounced(for: newDisplayText)
+                fetchHistoryResults(for: newDisplayText)
             }
             return
         }
@@ -311,6 +321,9 @@ class CommandPaletteState: ObservableObject {
 
             // Check for DNS resolution on single words
             checkDNSResolution(for: newDisplayText)
+
+            // Fetch history suggestions
+            fetchHistoryResults(for: newDisplayText)
             return
         }
 
@@ -321,6 +334,7 @@ class CommandPaletteState: ObservableObject {
             previewText = ""
             googleSuggestions = []
             googleSuggestionsQuery = ""
+            historyResults = []
             isTypingForward = true
             selectedIndex = 0
             showExactMatch = false
@@ -422,7 +436,7 @@ class CommandPaletteState: ObservableObject {
 
         var newSuggestions: [Suggestion] = []
 
-        // For URLs: show direct URL option first, no inline completion
+        // For URLs: show direct URL option first, then matching history URLs
         if inputType == .url {
             newSuggestions.append(Suggestion(
                 type: .directURL(query),
@@ -430,13 +444,36 @@ class CommandPaletteState: ObservableObject {
                 secondaryText: "Go to website"
             ))
 
+            // Add matching history URLs (sorted by frecency)
+            if includeHistorySuggestions {
+                let queryLower = query.lowercased()
+                let urlHistoryMatches = historyResults
+                    .filter { entry in
+                        let entryURL = entry.url.lowercased()
+                        // Match if history URL contains the input and isn't exactly the same
+                        return entryURL.contains(queryLower) && entryURL != queryLower
+                    }
+                    .sorted { $0.frecencyScore > $1.frecencyScore }
+                    .prefix(5)
+
+                for entry in urlHistoryMatches {
+                    newSuggestions.append(Suggestion(
+                        type: .historyEntry(entry.title, entry.url),
+                        displayText: entry.title.isEmpty ? cleanURLForDisplay(entry.url) : entry.title,
+                        secondaryText: cleanURLForDisplay(entry.url)
+                    ))
+                }
+            }
+
             // Add Google suggestions below (but don't auto-complete with them)
-            for suggestion in googleSuggestions {
-                newSuggestions.append(Suggestion(
-                    type: .searchSuggestion(suggestion),
-                    displayText: suggestion,
-                    secondaryText: nil
-                ))
+            if includeSearchSuggestions {
+                for suggestion in googleSuggestions {
+                    newSuggestions.append(Suggestion(
+                        type: .searchSuggestion(suggestion),
+                        displayText: suggestion,
+                        secondaryText: nil
+                    ))
+                }
             }
 
             suggestions = newSuggestions
@@ -460,16 +497,17 @@ class CommandPaletteState: ObservableObject {
             }
         }
 
-        // Find suggestions that are continuations of the input
-        let continuations = googleSuggestions.filter { suggestion in
+        // Find Google suggestions that are continuations of the input
+        let continuations = includeSearchSuggestions ? googleSuggestions.filter { suggestion in
             let lower = suggestion.lowercased()
             return lower.hasPrefix(queryLower) && lower != queryLower
-        }
+        } : []
 
         // Show exact match at top when:
         // 1. Triggered by backspace (showExactMatch), OR
         // 2. No suggestions available (so there's always something to select)
-        if showExactMatch || continuations.isEmpty {
+        let hasAnySuggestions = !continuations.isEmpty || !historyResults.isEmpty
+        if showExactMatch || !hasAnySuggestions {
             newSuggestions.append(Suggestion(
                 type: .searchSuggestion(query),
                 displayText: query,
@@ -477,13 +515,45 @@ class CommandPaletteState: ObservableObject {
             ))
         }
 
-        // Add continuations
-        for suggestion in continuations {
-            newSuggestions.append(Suggestion(
-                type: .searchSuggestion(suggestion),
-                displayText: suggestion,
-                secondaryText: nil
-            ))
+        // Merge history and Google suggestions by frecency
+        if includeHistorySuggestions && !historyResults.isEmpty {
+            // Create scored suggestions for merging
+            var scoredSuggestions: [(Suggestion, Double)] = []
+
+            // Add history entries with their frecency scores
+            // Display title as primary, URL as secondary (consistent with tab suggestions)
+            for entry in historyResults {
+                let suggestion = Suggestion(
+                    type: .historyEntry(entry.title, entry.url),
+                    displayText: entry.title.isEmpty ? cleanURLForDisplay(entry.url) : entry.title,
+                    secondaryText: cleanURLForDisplay(entry.url)
+                )
+                scoredSuggestions.append((suggestion, entry.frecencyScore))
+            }
+
+            // Add Google suggestions with base score of 1.0
+            for text in continuations {
+                let suggestion = Suggestion(
+                    type: .searchSuggestion(text),
+                    displayText: text,
+                    secondaryText: nil
+                )
+                scoredSuggestions.append((suggestion, 1.0))
+            }
+
+            // Sort by score (higher first) and take top results
+            scoredSuggestions.sort { $0.1 > $1.1 }
+            let mergedSuggestions = scoredSuggestions.prefix(20).map { $0.0 }
+            newSuggestions.append(contentsOf: mergedSuggestions)
+        } else {
+            // Just use Google suggestions
+            for suggestion in continuations {
+                newSuggestions.append(Suggestion(
+                    type: .searchSuggestion(suggestion),
+                    displayText: suggestion,
+                    secondaryText: nil
+                ))
+            }
         }
 
         suggestions = newSuggestions
@@ -507,6 +577,14 @@ class CommandPaletteState: ObservableObject {
         }
 
         let suggestion = suggestions[selectedIndex]
+
+        // History entries should NOT auto-complete or preview - just be selectable
+        if case .historyEntry = suggestion.type {
+            completionText = ""
+            previewText = ""
+            return
+        }
+
         let suggestionLower = suggestion.displayText.lowercased()
         let inputLower = inputText.lowercased()
 
@@ -525,10 +603,21 @@ class CommandPaletteState: ObservableObject {
         }
     }
 
+    // MARK: - History Suggestions
+
+    private func fetchHistoryResults(for query: String) {
+        guard includeHistorySuggestions, !query.isEmpty else {
+            historyResults = []
+            return
+        }
+        historyResults = historyManager?.search(query: query, limit: 10) ?? []
+        rebuildSuggestions()
+    }
+
     // MARK: - Google Suggestions Fetching
 
     private func fetchGoogleSuggestionsDebounced(for query: String) {
-        guard !query.isEmpty else { return }
+        guard includeSearchSuggestions, !query.isEmpty else { return }
         searchTask?.cancel()
         let currentQuery = query
 

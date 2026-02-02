@@ -17,7 +17,9 @@ struct WebViewContainer: View {
     var isDocked: Bool
     var isFullscreen: Bool = false
     var sidebarWidth: CGFloat
+    var historyManager: HistoryManager?
     var onSettingsNavigate: ((String) -> Void)?
+    var onOpenURLFromHistory: ((String) -> Void)?
 
     private let defaultColor = Color(NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0))
 
@@ -101,7 +103,9 @@ struct WebViewContainer: View {
                 SettingsViewWrapper(
                     isVisible: currentTabIsSettings,
                     settingsPath: currentSettingsPath,
-                    onNavigate: { path in onSettingsNavigate?(path) }
+                    historyManager: historyManager,
+                    onNavigate: { path in onSettingsNavigate?(path) },
+                    onOpenURL: { url in onOpenURLFromHistory?(url) }
                 )
                 .frame(width: frame.width, height: frame.height)
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
@@ -156,7 +160,9 @@ struct WebViewContainer: View {
 struct SettingsViewWrapper: NSViewRepresentable {
     let isVisible: Bool
     let settingsPath: String
+    let historyManager: HistoryManager?
     let onNavigate: (String) -> Void
+    let onOpenURL: (String) -> Void
 
     func makeNSView(context: Context) -> NSHostingView<SettingsView> {
         let navState = SettingsNavigationState()
@@ -164,7 +170,14 @@ struct SettingsViewWrapper: NSViewRepresentable {
         navState.onNavigate = onNavigate
         context.coordinator.navigationState = navState
 
-        let view = NSHostingView(rootView: SettingsView(navigationState: navState))
+        let hm = historyManager ?? HistoryManager()
+        context.coordinator.historyManager = hm
+
+        let view = NSHostingView(rootView: SettingsView(
+            navigationState: navState,
+            historyManager: hm,
+            onOpenURL: onOpenURL
+        ))
         view.safeAreaRegions = []
         view.layer?.cornerRadius = 9
         view.layer?.masksToBounds = true
@@ -189,6 +202,7 @@ struct SettingsViewWrapper: NSViewRepresentable {
 
     class Coordinator {
         var navigationState: SettingsNavigationState?
+        var historyManager: HistoryManager?
     }
 }
 

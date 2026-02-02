@@ -4,11 +4,12 @@ import SwiftData
 @main
 struct BrowserApp: App {
     @StateObject var tabManager = TabManager()
+    @StateObject var historyManager = HistoryManager()
     let modelContainer: ModelContainer
 
     init() {
         do {
-            modelContainer = try ModelContainer(for: Tab.self)
+            modelContainer = try ModelContainer(for: Tab.self, HistoryEntry.self)
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
         }
@@ -18,9 +19,11 @@ struct BrowserApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(tabManager)
+                .environmentObject(historyManager)
                 .onAppear {
-                    // Set modelContext on tabManager
+                    // Set modelContext on managers
                     tabManager.modelContext = modelContainer.mainContext
+                    historyManager.modelContext = modelContainer.mainContext
 
                     if let window = NSApplication.shared.windows.first {
                         window.titleVisibility = .hidden

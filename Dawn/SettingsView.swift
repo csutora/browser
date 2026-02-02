@@ -14,18 +14,31 @@ class SettingsNavigationState: ObservableObject {
 
 struct SettingsView: View {
     @ObservedObject var navigationState: SettingsNavigationState
+    @ObservedObject var historyManager: HistoryManager
+    let onOpenURL: (String) -> Void
+
     @StateObject private var keybindingsManager = KeybindingsManager.shared
     @AppStorage("fullscreenSidebarRadius") private var fullscreenSidebarRadius: Int = 13
+    @AppStorage("includeSearchSuggestions") private var includeSearchSuggestions: Bool = true
+    @AppStorage("includeHistorySuggestions") private var includeHistorySuggestions: Bool = true
 
     private var showKeybinds: Bool {
         navigationState.currentPath == "keybinds"
+    }
+
+    private var showHistory: Bool {
+        navigationState.currentPath == "history"
+    }
+
+    private var showMainSettings: Bool {
+        !showKeybinds && !showHistory
     }
 
     var body: some View {
         ZStack {
             Color(NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0))
 
-            if !showKeybinds {
+            if showMainSettings {
                 mainSettingsView
                     .transition(.asymmetric(
                         insertion: .move(edge: .leading).combined(with: .opacity),
@@ -42,9 +55,23 @@ struct SettingsView: View {
                         removal: .move(edge: .trailing).combined(with: .opacity)
                     ))
             }
+
+            if showHistory {
+                HistoryView(
+                    historyManager: historyManager,
+                    onBack: {
+                        navigationState.navigate(to: "settings")
+                    },
+                    onOpenURL: onOpenURL
+                )
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .move(edge: .trailing).combined(with: .opacity)
+                    ))
+            }
         }
         .ignoresSafeArea()
-        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showKeybinds)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: navigationState.currentPath)
     }
 
     var mainSettingsView: some View {
@@ -89,13 +116,36 @@ struct SettingsView: View {
                     }
                 }
 
-                // Keyboard Shortcuts - Bento Tile
+                // Search Section
+                SettingsSection(title: "Search") {
+                    SettingsRow(title: "Search suggestions") {
+                        Toggle("", isOn: $includeSearchSuggestions)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                    }
+
+                    SettingsRow(title: "History suggestions") {
+                        Toggle("", isOn: $includeHistorySuggestions)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                    }
+                }
+
+                // Navigation Tiles
                 SettingsBentoTile(
                     icon: "keyboard",
                     title: "Keyboard Shortcuts",
                     subtitle: "\(KeybindAction.allCases.count) shortcuts configured"
                 ) {
                     navigationState.navigate(to: "keybinds")
+                }
+
+                SettingsBentoTile(
+                    icon: "clock.arrow.circlepath",
+                    title: "Browsing History",
+                    subtitle: "View and manage your history"
+                ) {
+                    navigationState.navigate(to: "history")
                 }
 
                 // Sync Section (placeholder)

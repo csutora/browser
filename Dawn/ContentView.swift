@@ -7,6 +7,7 @@ extension Notification.Name {
 
 struct ContentView: View {
     @EnvironmentObject var tabManager: TabManager
+    @EnvironmentObject var historyManager: HistoryManager
 
     @Query(sort: \Tab.sortIndex, animation: .spring(response: 0.35, dampingFraction: 0.75)) private var tabs: [Tab]
 
@@ -52,8 +53,18 @@ struct ContentView: View {
                 isDocked: isDocked,
                 isFullscreen: isFullscreen,
                 sidebarWidth: CGFloat(sidebarWidth),
+                historyManager: historyManager,
                 onSettingsNavigate: { path in
                     tabManager.updateSettingsPath(path)
+                },
+                onOpenURLFromHistory: { url in
+                    // Open URL in current tab or create new one
+                    if let currentId = tabManager.currentTabId,
+                       let state = browserStates[currentId] {
+                        state.loadURL(url)
+                        // Navigate back to settings main
+                        tabManager.updateSettingsPath("settings")
+                    }
                 }
             )
 
@@ -84,6 +95,7 @@ struct ContentView: View {
         .animation(.spring(response: 0.25, dampingFraction: 0.9), value: commandPaletteState.isVisible)
         .onAppear {
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: isDocked)
+            commandPaletteState.historyManager = historyManager
 
             if tabManager.currentTabId == nil {
                 if let first = tabs.first { tabManager.selectTab(first) }
@@ -155,7 +167,8 @@ struct ContentView: View {
         case .closeTab:
             guard let currentId = tabManager.currentTabId,
                   let tab = tabs.first(where: { $0.id == currentId }) else { return }
-            tabManager.closeTab(tab, allTabs: tabs)
+            let interactionState = browserStates[currentId]?.captureInteractionState()
+            tabManager.closeTab(tab, allTabs: tabs, interactionState: interactionState)
 
         case .reopenClosedTab:
             tabManager.reopenLastClosedTab(existingCount: tabs.count)
@@ -242,7 +255,8 @@ struct ContentView: View {
             urlToLoad = "https://www.google.com/search?q=\(encoded)"
 
         case .directURL(let url):
-            urlToLoad = url.lowercased().hasPrefix("http") ? url : "https://\(url)"
+            // Don't prepend https:// if any protocol already exists
+            urlToLoad = url.contains("://") ? url : "https://\(url)"
 
         case .dnsResolved(let hostname):
             // Single word that resolved via DNS (e.g., MagicDNS, intranet)
@@ -254,6 +268,17 @@ struct ContentView: View {
         case .recentTab(let tab):
             // Switch to tab instead
             tabManager.selectTab(tab)
+            return
+        }
+
+        // Handle dawn:// URLs specially - open settings tab
+        if urlToLoad.lowercased().hasPrefix("dawn://") {
+            tabManager.openSettings()
+            // Navigate to specific path if specified (e.g., dawn://history)
+            let path = String(urlToLoad.dropFirst("dawn://".count))
+            if !path.isEmpty && path != "settings" {
+                tabManager.updateSettingsPath(path)
+            }
             return
         }
 
@@ -339,7 +364,9 @@ struct ContentView: View {
                 let s = BrowserState(
                     tabId: tab.id,
                     tabManager: tabManager,
-                    initialURL: initialURL
+                    historyManager: historyManager,
+                    initialURL: initialURL,
+                    interactionState: tab.interactionState
                 )
                 browserStates[tab.id] = s
             }
