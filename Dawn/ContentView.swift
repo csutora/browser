@@ -368,6 +368,10 @@ struct ContentView: View {
                     initialURL: initialURL,
                     interactionState: tab.interactionState
                 )
+                // Wire up new tab callback for target="_blank" links
+                s.onNewTabRequested = { [weak tabManager] url in
+                    tabManager?.createTab(url: url.absoluteString, existingCount: tabs.count)
+                }
                 browserStates[tab.id] = s
             }
         }

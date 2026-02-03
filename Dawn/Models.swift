@@ -243,12 +243,45 @@ class TabManager: ObservableObject {
     }
 }
 
+// MARK: - Navigation Decider (handles target="_blank" links and Cmd+click)
+class NavigationDecider: WebPage.NavigationDeciding {
+    var onNewTabRequested: ((URL) -> Void)?
+
+    func decidePolicy(
+        for action: WebPage.NavigationAction,
+        preferences: inout WebPage.NavigationPreferences
+    ) async -> WKNavigationActionPolicy {
+        guard let url = action.request.url else { return .allow }
+
+        // target == nil means new window/tab request (e.g., target="_blank" or window.open())
+        if action.target == nil {
+            await MainActor.run {
+                onNewTabRequested?(url)
+            }
+            return .cancel
+        }
+
+        // Cmd+click on a link opens in new tab
+        if action.navigationType == .linkActivated && action.modifierFlags.contains(.command) {
+            await MainActor.run {
+                onNewTabRequested?(url)
+            }
+            return .cancel
+        }
+
+        return .allow
+    }
+}
+
 // MARK: - Browser State
 class BrowserState: ObservableObject {
     let webPage: WebPage
     let tabId: UUID
     weak var tabManager: TabManager?
     weak var historyManager: HistoryManager?
+
+    // Navigation decider for handling new tab requests
+    private let navigationDecider: NavigationDecider
 
     private var pendingURL: URL?
     private var hasLoadedInitialContent = false
@@ -272,8 +305,19 @@ class BrowserState: ObservableObject {
 
     private var pendingInteractionState: Data?
 
+    // Callback for new tab requests (set by ContentView)
+    var onNewTabRequested: ((URL) -> Void)? {
+        get { navigationDecider.onNewTabRequested }
+        set { navigationDecider.onNewTabRequested = newValue }
+    }
+
     init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
-        self.webPage = WebPage()
+        // Create navigation decider first
+        self.navigationDecider = NavigationDecider()
+
+        // Create WebPage with the navigation decider
+        self.webPage = WebPage(navigationDecider: navigationDecider)
+
         self.tabId = tabId
         self.tabManager = tabManager
         self.historyManager = historyManager
