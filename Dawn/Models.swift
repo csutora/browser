@@ -114,12 +114,14 @@ class TabManager: ObservableObject {
         try? modelContext?.save()
     }
 
-    func createTab(url: String = "https://www.google.com", existingCount: Int) {
+    func createTab(url: String = "https://www.google.com", existingCount: Int, switchToTab: Bool = false) {
         guard let context = modelContext else { return }
         let t = Tab(url: url, sortIndex: existingCount)
         context.insert(t)
-        currentTabId = t.id
-        currentTabURL = t.url
+        if switchToTab {
+            currentTabId = t.id
+            currentTabURL = t.url
+        }
         try? context.save()
     }
 
@@ -245,7 +247,8 @@ class TabManager: ObservableObject {
 
 // MARK: - Navigation Decider (handles target="_blank" links and Cmd+click)
 class NavigationDecider: WebPage.NavigationDeciding {
-    var onNewTabRequested: ((URL) -> Void)?
+    /// Callback when a new tab is requested. Bool indicates whether to switch focus to the new tab.
+    var onNewTabRequested: ((URL, Bool) -> Void)?
 
     func decidePolicy(
         for action: WebPage.NavigationAction,
@@ -254,17 +257,18 @@ class NavigationDecider: WebPage.NavigationDeciding {
         guard let url = action.request.url else { return .allow }
 
         // target == nil means new window/tab request (e.g., target="_blank" or window.open())
+        // These should switch focus to the new tab
         if action.target == nil {
             await MainActor.run {
-                onNewTabRequested?(url)
+                onNewTabRequested?(url, true)
             }
             return .cancel
         }
 
-        // Cmd+click on a link opens in new tab
+        // Cmd+click on a link opens in new tab (background, no focus switch)
         if action.navigationType == .linkActivated && action.modifierFlags.contains(.command) {
             await MainActor.run {
-                onNewTabRequested?(url)
+                onNewTabRequested?(url, false)
             }
             return .cancel
         }
@@ -306,7 +310,8 @@ class BrowserState: ObservableObject {
     private var pendingInteractionState: Data?
 
     // Callback for new tab requests (set by ContentView)
-    var onNewTabRequested: ((URL) -> Void)? {
+    // Bool indicates whether to switch focus to the new tab
+    var onNewTabRequested: ((URL, Bool) -> Void)? {
         get { navigationDecider.onNewTabRequested }
         set { navigationDecider.onNewTabRequested = newValue }
     }

@@ -278,8 +278,8 @@ struct ContentView: View {
         }
 
         if mode == .newTab {
-            // Create new tab with URL
-            tabManager.createTab(url: urlToLoad, existingCount: tabs.count)
+            // Create new tab with URL and switch to it
+            tabManager.createTab(url: urlToLoad, existingCount: tabs.count, switchToTab: true)
         } else {
             // Navigate current tab
             guard let currentId = tabManager.currentTabId,
@@ -363,9 +363,9 @@ struct ContentView: View {
                     initialURL: initialURL,
                     interactionState: tab.interactionState
                 )
-                // Wire up new tab callback for target="_blank" links
-                s.onNewTabRequested = { [weak tabManager] url in
-                    tabManager?.createTab(url: url.absoluteString, existingCount: tabs.count)
+                // Wire up new tab callback for target="_blank" links and Cmd+click
+                s.onNewTabRequested = { [weak tabManager] url, switchToTab in
+                    tabManager?.createTab(url: url.absoluteString, existingCount: tabs.count, switchToTab: switchToTab)
                 }
                 browserStates[tab.id] = s
             }
