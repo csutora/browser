@@ -97,6 +97,7 @@ struct ContentView: View {
             }
             syncStates()
             setupKeybindHandler()
+            updateWindowTitle()
         }
         .onChange(of: sidebarWidth) { _, newValue in
             mouseTracker.updateSettings(sidebarWidth: newValue, isDocked: isDocked)
@@ -104,7 +105,13 @@ struct ContentView: View {
         .onChange(of: isDocked) { _, newValue in
             mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: newValue)
         }
-        .onChange(of: tabs) { _, _ in syncStates() }
+        .onChange(of: tabs) { _, _ in
+            syncStates()
+            updateWindowTitle()
+        }
+        .onChange(of: tabManager.currentTabId) { _, _ in
+            updateWindowTitle()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             isFullscreen = true
         }
@@ -372,5 +379,22 @@ struct ContentView: View {
         }
         let activeWebTabIds = tabs.filter { !$0.isSettings }.map { $0.id }
         for id in browserStates.keys { if !activeWebTabIds.contains(id) { browserStates.removeValue(forKey: id) } }
+    }
+
+    func updateWindowTitle() {
+        guard let window = NSApplication.shared.windows.first else { return }
+
+        // Get current tab
+        guard let currentId = tabManager.currentTabId,
+              let currentTab = tabs.first(where: { $0.id == currentId }) else {
+            window.title = "Dawn"
+            return
+        }
+
+        if currentTab.isSettings {
+            window.title = "Settings"
+        } else {
+            window.title = currentTab.title.isEmpty ? "Untitled" : currentTab.title
+        }
     }
 }
