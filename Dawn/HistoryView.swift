@@ -44,14 +44,9 @@ enum HistoryDateCategory: String, CaseIterable {
     }
 }
 
-// MARK: - History Row View
-struct HistoryRowView: View {
+// MARK: - History Row Content (simplified, no gestures)
+struct HistoryRowContent: View {
     let entry: HistoryEntry
-    let isSelected: Bool
-    let onSelect: () -> Void
-    let onOpen: () -> Void
-
-    @State private var isHovered = false
 
     private var displayTitle: String {
         entry.title.isEmpty ? cleanURLForDisplay(entry.url) : entry.title
@@ -74,22 +69,11 @@ struct HistoryRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            // Selection indicator
-            Circle()
-                .fill(isSelected ? Color.accentColor : Color.clear)
-                .frame(width: 6, height: 6)
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(isSelected ? 0 : 0.2), lineWidth: 1)
-                )
-
-            // Favicon placeholder
             Image(systemName: "globe")
                 .font(.system(size: 14))
                 .foregroundColor(.secondary)
                 .frame(width: 20, height: 20)
 
-            // Title and URL
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayTitle)
                     .font(.system(size: 13))
@@ -104,7 +88,6 @@ struct HistoryRowView: View {
 
             Spacer()
 
-            // Visit count badge (if > 1)
             if entry.visitCount > 1 {
                 Text("\(entry.visitCount)")
                     .font(.system(size: 10, weight: .medium))
@@ -115,62 +98,13 @@ struct HistoryRowView: View {
                     .clipShape(Capsule())
             }
 
-            // Time
             Text(timeString)
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.2) : (isHovered ? Color.white.opacity(0.04) : Color.clear))
-        )
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovered = hovering
-            }
-        }
-        .onTapGesture {
-            // Check for modifier keys
-            if NSEvent.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.shift) {
-                onSelect()
-            } else {
-                onOpen()
-            }
-        }
-    }
-}
-
-// MARK: - History Section View
-struct HistorySectionView: View {
-    let category: HistoryDateCategory
-    let entries: [HistoryEntry]
-    let selectedIds: Set<UUID>
-    let onSelect: (HistoryEntry) -> Void
-    let onOpen: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Section header
-            Text(category.rawValue.uppercased())
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 12)
-
-            // Entries
-            VStack(spacing: 2) {
-                ForEach(entries) { entry in
-                    HistoryRowView(
-                        entry: entry,
-                        isSelected: selectedIds.contains(entry.id),
-                        onSelect: { onSelect(entry) },
-                        onOpen: { onOpen(entry.url) }
-                    )
-                }
-            }
-        }
     }
 }
 
@@ -181,8 +115,7 @@ struct HistoryView: View {
     let onOpenURL: (String) -> Void
 
     @State private var searchText = ""
-    @State private var selectedIds: Set<UUID> = []
-    @State private var lastSelectedEntry: HistoryEntry?
+    @State private var selectedIds: Set<HistoryEntry.ID> = []
     @State private var allEntries: [HistoryEntry] = []
     @State private var showClearConfirmation = false
 
@@ -239,6 +172,9 @@ struct HistoryView: View {
         }
         .onAppear {
             loadEntries()
+        }
+        .onChange(of: searchText) { _, _ in
+            selectedIds.removeAll()
         }
         .alert("Clear All History", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -309,23 +245,46 @@ struct HistoryView: View {
     }
 
     private var historyList: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        List(selection: $selectedIds) {
             ForEach(groupedEntries, id: \.0) { category, entries in
-                HistorySectionView(
-                    category: category,
-                    entries: entries,
-                    selectedIds: selectedIds,
-                    onSelect: { entry in handleSelect(entry) },
-                    onOpen: { url in
-                        selectedIds.removeAll()
-                        onOpenURL(url)
+                Section {
+                    ForEach(entries) { entry in
+                        HistoryRowContent(entry: entry)
+                            .tag(entry.id)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
                     }
-                )
+                } header: {
+                    Text(category.rawValue.uppercased())
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
             }
         }
-        .padding(.vertical, 12)
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
         .background(Color.white.opacity(0.03))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(minHeight: 300)
+        .onDeleteCommand {
+            deleteSelected()
+        }
+        .onKeyPress(.return) {
+            openSelectedEntries()
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            selectedIds.removeAll()
+            return .handled
+        }
+        .onKeyPress(keys: [.init("a")]) { press in
+            if press.modifiers.contains(.command) {
+                selectAll()
+                return .handled
+            }
+            return .ignored
+        }
     }
 
     private var emptyState: some View {
@@ -398,41 +357,23 @@ struct HistoryView: View {
         allEntries = historyManager.fetchAll()
     }
 
-    private func handleSelect(_ entry: HistoryEntry) {
-        let modifiers = NSEvent.modifierFlags
+    private func openSelectedEntries() {
+        guard !selectedIds.isEmpty else { return }
 
-        if modifiers.contains(.command) {
-            // Cmd+click: toggle individual
-            if selectedIds.contains(entry.id) {
-                selectedIds.remove(entry.id)
-            } else {
-                selectedIds.insert(entry.id)
-            }
-            lastSelectedEntry = entry
-        } else if modifiers.contains(.shift), let lastEntry = lastSelectedEntry {
-            // Shift+click: select range
-            guard let lastIndex = filteredEntries.firstIndex(where: { $0.id == lastEntry.id }),
-                  let currentIndex = filteredEntries.firstIndex(where: { $0.id == entry.id }) else {
-                selectedIds.insert(entry.id)
-                lastSelectedEntry = entry
-                return
-            }
-
-            let range = min(lastIndex, currentIndex)...max(lastIndex, currentIndex)
-            for i in range {
-                selectedIds.insert(filteredEntries[i].id)
-            }
-        } else {
-            // Regular click with modifier: start selection
-            selectedIds = [entry.id]
-            lastSelectedEntry = entry
+        // Open in list order
+        for entry in filteredEntries where selectedIds.contains(entry.id) {
+            onOpenURL(entry.url)
         }
+        selectedIds.removeAll()
+    }
+
+    private func selectAll() {
+        selectedIds = Set(filteredEntries.map { $0.id })
     }
 
     private func deleteSelected() {
         historyManager.deleteEntries(withIds: selectedIds)
         selectedIds.removeAll()
-        lastSelectedEntry = nil
         loadEntries()
     }
 }

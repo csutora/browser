@@ -58,13 +58,8 @@ struct ContentView: View {
                     tabManager.updateSettingsPath(path)
                 },
                 onOpenURLFromHistory: { url in
-                    // Open URL in current tab or create new one
-                    if let currentId = tabManager.currentTabId,
-                       let state = browserStates[currentId] {
-                        state.loadURL(url)
-                        // Navigate back to settings main
-                        tabManager.updateSettingsPath("settings")
-                    }
+                    // Always open history URLs in new tabs
+                    tabManager.createTab(url: url, existingCount: tabs.count)
                 }
             )
 
