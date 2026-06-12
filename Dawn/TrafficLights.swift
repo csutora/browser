@@ -1,37 +1,4 @@
-import SwiftUI
 import AppKit
-
-struct TrafficLightsView: View {
-    var isDocked: Bool
-    var isSidebarFullyOpen: Bool
-
-    @State private var isHovering = false
-
-    // Only allow hover when sidebar is docked or floating and fully open
-    private var canHover: Bool {
-        isDocked || isSidebarFullyOpen
-    }
-
-    var body: some View {
-        TrafficLightsRepresentable(isHovering: isHovering && canHover)
-            .frame(width: 58, height: 16)
-            .offset(x: -1)
-            .onHover { isHovering = $0 }
-            .allowsHitTesting(canHover)
-    }
-}
-
-struct TrafficLightsRepresentable: NSViewRepresentable {
-    var isHovering: Bool
-
-    func makeNSView(context: Context) -> TrafficLightsContainerView {
-        TrafficLightsContainerView()
-    }
-
-    func updateNSView(_ nsView: TrafficLightsContainerView, context: Context) {
-        nsView.isHovering = isHovering
-    }
-}
 
 class TrafficLightsContainerView: NSView {
     private var greyCircles: [NSView] = []
@@ -42,8 +9,14 @@ class TrafficLightsContainerView: NSView {
     private let buttonSpacing: CGFloat = 22
     private let buttonSize: CGFloat = 14
 
-    var isHovering = false {
+    var canHover: Bool = true {
         didSet { updateButtonVisibility() }
+    }
+
+    private var isHoveringMouse = false
+
+    var isHovering: Bool {
+        isHoveringMouse && canHover
     }
 
     override init(frame: NSRect) {
@@ -90,12 +63,21 @@ class TrafficLightsContainerView: NSView {
             self?.isFullscreen = false
             self?.updateButtonVisibility()
         })
+
+        // On exit macOS resets the buttons to their default position; reposition them into the
+        // sidebar only after the exit transition has fully finished.
+        observers.append(center.addObserver(
+            forName: NSWindow.didExitFullScreenNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.isFullscreen = false
+            self?.updateButtonVisibility()
+        })
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window != nil else { return }
-        // Delay needed - window buttons aren't immediately accessible
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.updateButtonVisibility()
         }
@@ -123,7 +105,6 @@ class TrafficLightsContainerView: NSView {
             button.updateTrackingAreas()
         }
 
-        // Update tracking areas on the buttons' container
         if let closeButton = window.standardWindowButton(.closeButton),
            let container = closeButton.superview {
             container.updateTrackingAreas()
@@ -135,10 +116,8 @@ class TrafficLightsContainerView: NSView {
 
         let shouldShowButtons = isFullscreen || isHovering
 
-        // Toggle grey circles
         greyCircles.forEach { $0.isHidden = shouldShowButtons }
 
-        // Toggle and position real buttons
         for type in buttonTypes {
             window.standardWindowButton(type)?.isHidden = !shouldShowButtons
         }
@@ -146,6 +125,31 @@ class TrafficLightsContainerView: NSView {
         if shouldShowButtons {
             repositionButtons()
         }
+    }
+
+    // MARK: - Hover Tracking
+
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea { removeTrackingArea(existing) }
+        trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self
+        )
+        addTrackingArea(trackingArea!)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHoveringMouse = true
+        updateButtonVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHoveringMouse = false
+        updateButtonVisibility()
     }
 
     deinit {

@@ -1,4 +1,3 @@
-import SwiftUI
 import AppKit
 import Combine
 
@@ -7,6 +6,7 @@ class MouseTracker: ObservableObject {
 
     var sidebarWidth: CGFloat = 260.0
     var isDocked: Bool = true
+    weak var window: NSWindow?
 
     private var isWindowDragging: Bool = false
     private var isTransitioning: Bool = false
@@ -78,7 +78,7 @@ class MouseTracker: ObservableObject {
 
         if NSEvent.pressedMouseButtons > 0 || isTransitioning { return }
 
-        guard let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first else { return }
+        guard let window = self.window ?? NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first else { return }
 
         let mouseLoc = NSEvent.mouseLocation
         let frame = window.frame

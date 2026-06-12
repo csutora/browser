@@ -1,4 +1,4 @@
-import SwiftUI
+import AppKit
 import SwiftData
 import Combine
 import WebKit
@@ -31,9 +31,9 @@ final class Tab: Identifiable {
 
     var isSettings: Bool { tabType == .settings }
 
-    var backgroundColor: Color? {
+    var nsBackgroundColor: NSColor? {
         guard let hex = backgroundColorHex else { return nil }
-        return Color(hex: hex)
+        return NSColor(hex: hex)
     }
 
     init(id: UUID = UUID(), title: String = "New Tab", url: String = "https://www.google.com", sortIndex: Int = 0, tabType: TabType = .web) {
@@ -58,12 +58,14 @@ struct ClosedTabInfo: Codable {
     let sortIndex: Int
     let tabType: TabType
     let backgroundColorHex: String?
-    let interactionState: Data?  // Navigation state (back/forward history)
+    let interactionState: Data?
 }
 
 // MARK: - Tab Manager
 class TabManager: ObservableObject {
-    @AppStorage("currentTabId") var currentTabIdString: String = ""
+    @Published var currentTabIdString: String = UserDefaults.standard.string(forKey: "currentTabId") ?? "" {
+        didSet { UserDefaults.standard.set(currentTabIdString, forKey: "currentTabId") }
+    }
     var modelContext: ModelContext?
     private var saveTask: DispatchWorkItem?
 
@@ -96,7 +98,7 @@ class TabManager: ObservableObject {
         set { currentTabIdString = newValue?.uuidString ?? "" }
     }
 
-    var currentTabURL: String = ""
+    @Published var currentTabURL: String = ""
 
     var canReopenClosedTab: Bool {
         !closedTabsStack.isEmpty
@@ -114,6 +116,11 @@ class TabManager: ObservableObject {
         try? modelContext?.save()
     }
 
+    func fetchTabs() -> [Tab] {
+        let descriptor = FetchDescriptor<Tab>(sortBy: [SortDescriptor(\.sortIndex)])
+        return (try? modelContext?.fetch(descriptor)) ?? []
+    }
+
     func createTab(url: String = "https://www.google.com", existingCount: Int, switchToTab: Bool = false) {
         guard let context = modelContext else { return }
         let t = Tab(url: url, sortIndex: existingCount)
@@ -123,6 +130,7 @@ class TabManager: ObservableObject {
             currentTabURL = t.url
         }
         try? context.save()
+        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
     }
 
     func closeTab(_ tab: Tab, allTabs: [Tab], interactionState: Data? = nil) {
@@ -139,7 +147,6 @@ class TabManager: ObservableObject {
                 interactionState: interactionState
             )
             closedTabsStack.append(closedInfo)
-            // Limit stack size
             if closedTabsStack.count > maxClosedTabs {
                 closedTabsStack.removeFirst()
             }
@@ -159,6 +166,7 @@ class TabManager: ObservableObject {
         }
         context.delete(tab)
         try? context.save()
+        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
     }
 
     func reopenLastClosedTab(existingCount: Int) {
@@ -177,12 +185,12 @@ class TabManager: ObservableObject {
         currentTabId = tab.id
         currentTabURL = tab.url
         try? context.save()
+        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
     }
 
     func selectTab(_ tab: Tab) {
         currentTabId = tab.id
         currentTabURL = tab.url
-        // Update lastAccessedAt through the context to avoid threading issues
         updateLastAccessedAt(for: tab.id)
     }
 
@@ -210,11 +218,9 @@ class TabManager: ObservableObject {
     func openSettings() {
         guard let context = modelContext else { return }
 
-        // Fetch all tabs to check for existing settings tab
         let descriptor = FetchDescriptor<Tab>(sortBy: [SortDescriptor(\.sortIndex)])
         let allTabs = (try? context.fetch(descriptor)) ?? []
 
-        // Find existing settings tab or create one
         if let settingsTab = allTabs.first(where: { $0.isSettings }) {
             selectTab(settingsTab)
         } else {
@@ -223,6 +229,7 @@ class TabManager: ObservableObject {
             currentTabId = t.id
             currentTabURL = "dawn://settings"
             try? context.save()
+            NotificationCenter.default.post(name: .tabsDidChange, object: nil)
         }
     }
 
@@ -242,284 +249,34 @@ class TabManager: ObservableObject {
             if let bg = backgroundColorHex { tab.backgroundColorHex = bg }
             scheduleSave()
         }
+        NotificationCenter.default.post(name: .tabDataDidChange, object: id)
     }
 }
 
-// MARK: - Navigation Decider (handles target="_blank" links and Cmd+click)
-class NavigationDecider: WebPage.NavigationDeciding {
-    /// Callback when a new tab is requested. Bool indicates whether to switch focus to the new tab.
-    var onNewTabRequested: ((URL, Bool) -> Void)?
-
-    func decidePolicy(
-        for action: WebPage.NavigationAction,
-        preferences: inout WebPage.NavigationPreferences
-    ) async -> WKNavigationActionPolicy {
-        guard let url = action.request.url else { return .allow }
-
-        // target == nil means new window/tab request (e.g., target="_blank" or window.open())
-        // These should switch focus to the new tab
-        if action.target == nil {
-            await MainActor.run {
-                onNewTabRequested?(url, true)
-            }
-            return .cancel
-        }
-
-        // Cmd+click on a link opens in new tab (background, no focus switch)
-        if action.navigationType == .linkActivated && action.modifierFlags.contains(.command) {
-            await MainActor.run {
-                onNewTabRequested?(url, false)
-            }
-            return .cancel
-        }
-
-        return .allow
-    }
+// MARK: - Notification Names
+extension Notification.Name {
+    static let tabsDidChange = Notification.Name("tabsDidChange")
+    static let tabDataDidChange = Notification.Name("tabDataDidChange")
+    static let focusURLBar = Notification.Name("focusURLBar")
 }
 
-// MARK: - Browser State
-class BrowserState: ObservableObject {
-    let webPage: WebPage
-    let tabId: UUID
-    weak var tabManager: TabManager?
-    weak var historyManager: HistoryManager?
-
-    // Navigation decider for handling new tab requests
-    private let navigationDecider: NavigationDecider
-
-    private var pendingURL: URL?
-    private var hasLoadedInitialContent = false
-    private var lastStyledURL: URL?
-    private var lastRecordedURL: String?
-
-    // Modern Safari User-Agent for website compatibility
-    private static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15"
-
-    // Published properties for UI bindings
-    @Published var canGoBack = false
-    @Published var canGoForward = false
-    @Published var isLoading = false
-    @Published var fetchedBackgroundColor: Color?
-    @Published var currentZoom: Double = 1.0
-
-    // Zoom constraints
-    private let minZoom: Double = 0.5
-    private let maxZoom: Double = 3.0
-    private let zoomStep: Double = 0.1
-
-    private var pendingInteractionState: Data?
-
-    // Callback for new tab requests (set by ContentView)
-    // Bool indicates whether to switch focus to the new tab
-    var onNewTabRequested: ((URL, Bool) -> Void)? {
-        get { navigationDecider.onNewTabRequested }
-        set { navigationDecider.onNewTabRequested = newValue }
-    }
-
-    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
-        // Create navigation decider first
-        self.navigationDecider = NavigationDecider()
-
-        // Create WebPage with the navigation decider
-        self.webPage = WebPage(navigationDecider: navigationDecider)
-
-        self.tabId = tabId
-        self.tabManager = tabManager
-        self.historyManager = historyManager
-        self.pendingURL = initialURL
-        self.pendingInteractionState = interactionState
-
-        // Set custom User-Agent so websites treat this as modern Safari
-        self.webPage.customUserAgent = Self.safariUserAgent
-    }
-
-    // MARK: - Event Handlers (called from SwiftUI onChange)
-
-    func handleURLChange(_ newURL: URL?) {
-        guard let url = newURL else { return }
-        tabManager?.updateTab(tabId, url: url.absoluteString)
-        // Update navigation state immediately and again after a short delay
-        // (backForwardList may not be updated synchronously)
-        updateNavigationState()
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(100))
-            self.updateNavigationState()
-        }
-    }
-
-    func handleTitleChange(_ newTitle: String) {
-        guard !newTitle.isEmpty else { return }
-        tabManager?.updateTab(tabId, title: newTitle)
-
-        // Record to history when title is available (indicates page loaded)
-        if let url = webPage.url,
-           !url.absoluteString.hasPrefix("dawn://"),
-           url.absoluteString != lastRecordedURL {
-            lastRecordedURL = url.absoluteString
-            historyManager?.recordVisit(title: newTitle, url: url.absoluteString)
-        }
-    }
-
-    func handleLoadingChange(_ loading: Bool) {
-        isLoading = loading
-
-        // Always update navigation state when loading state changes
-        updateNavigationState()
-
-        // Fetch background color when loading finishes
-        if !loading, let url = webPage.url, url != lastStyledURL {
-            lastStyledURL = url
-
-            Task { @MainActor in
-                // Delay to ensure CSS is fully applied and navigation state is stable
-                try? await Task.sleep(for: .milliseconds(500))
-                self.fetchBackgroundColor()
-                self.updateNavigationState()
-            }
-        }
-    }
-
-    private func updateNavigationState() {
-        canGoBack = !webPage.backForwardList.backList.isEmpty
-        canGoForward = !webPage.backForwardList.forwardList.isEmpty
-    }
-
-    private func fetchBackgroundColor() {
-        let js = """
-        function getColor(el) {
-            if (!el) return null;
-            var bg = getComputedStyle(el).backgroundColor;
-            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return bg;
-            return null;
-        }
-        return getColor(document.body) || getColor(document.documentElement) || 'rgb(255, 255, 255)';
-        """
-
-        Task { @MainActor in
-            do {
-                let result = try await webPage.callJavaScript(js)
-                if let colorString = result as? String, let hex = self.parseColorToHex(colorString) {
-                    self.fetchedBackgroundColor = Color(hex: hex)
-                    self.tabManager?.updateTab(self.tabId, backgroundColorHex: hex)
-                }
-            } catch {
-                // Ignore JS errors
-            }
-        }
-    }
-
-    private func parseColorToHex(_ colorString: String) -> String? {
-        // Parse rgb(r, g, b) or rgba(r, g, b, a) format
-        let pattern = #"rgba?\((\d+),\s*(\d+),\s*(\d+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: colorString, range: NSRange(colorString.startIndex..., in: colorString)) else {
-            return nil
-        }
-
-        guard let rRange = Range(match.range(at: 1), in: colorString),
-              let gRange = Range(match.range(at: 2), in: colorString),
-              let bRange = Range(match.range(at: 3), in: colorString),
-              let r = Int(colorString[rRange]),
-              let g = Int(colorString[gRange]),
-              let b = Int(colorString[bRange]) else {
-            return nil
-        }
-
-        return String(format: "#%02X%02X%02X", r, g, b)
-    }
-
-    func loadInitialContentIfNeeded() {
-        // Only load once per BrowserState lifetime
-        guard !hasLoadedInitialContent else { return }
-        hasLoadedInitialContent = true
-
-        // Note: interactionState restoration would require accessing the underlying WKWebView
-        // For now, just load the URL
-        if let url = pendingURL {
-            webPage.load(URLRequest(url: url))
-        }
-        pendingInteractionState = nil
-    }
-
-    func loadURL(_ s: String) {
-        var urlString = s
-        // Don't prepend https:// if any protocol already exists
-        if !urlString.contains("://") {
-            urlString = "https://" + urlString
-        }
-        guard let url = URL(string: urlString) else { return }
-        webPage.load(URLRequest(url: url))
-    }
-
-    func goBack() {
-        guard let item = webPage.backForwardList.backList.last else { return }
-        webPage.load(item)
-        // Update navigation state immediately for responsive UI
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.updateNavigationState()
-        }
-    }
-
-    func goForward() {
-        guard let item = webPage.backForwardList.forwardList.first else { return }
-        webPage.load(item)
-        // Update navigation state immediately for responsive UI
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.updateNavigationState()
-        }
-    }
-
-    func reload() {
-        lastStyledURL = nil  // Force re-fetch on reload
-        webPage.reload()
-    }
-
-    func stopLoading() {
-        webPage.stopLoading()
-    }
-
-    func captureInteractionState() -> Data? {
-        // Note: interactionState is on WKWebView, not exposed through SwiftUI WebPage wrapper
-        // This would require accessing the underlying WKWebView to implement fully
-        return nil
-    }
-
-    // MARK: - Zoom
-
-    func zoomIn() {
-        let newZoom = min(currentZoom + zoomStep, maxZoom)
-        setZoom(newZoom)
-    }
-
-    func zoomOut() {
-        let newZoom = max(currentZoom - zoomStep, minZoom)
-        setZoom(newZoom)
-    }
-
-    func resetZoom() {
-        setZoom(1.0)
-    }
-
-    private func setZoom(_ zoom: Double) {
-        currentZoom = zoom
-        // Use JavaScript to set zoom on the document
-        let js = "document.documentElement.style.zoom = '\(zoom)'"
-        Task { @MainActor in
-            _ = try? await webPage.callJavaScript(js)
-        }
-    }
+// MARK: - Settings Path Helper
+func extractSettingsPath(from url: String) -> String {
+    guard url.hasPrefix("dawn://") else { return "settings" }
+    let path = String(url.dropFirst("dawn://".count))
+    return path.isEmpty ? "settings" : path
 }
 
-// MARK: - Color Extension
-extension Color {
-    init?(hex: String) {
+// MARK: - NSColor Extension
+extension NSColor {
+    convenience init?(hex: String) {
         var hexString = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         if hexString.hasPrefix("#") { hexString.removeFirst() }
         guard hexString.count == 6,
               let int = UInt64(hexString, radix: 16) else { return nil }
-        let r = Double((int >> 16) & 0xFF) / 255.0
-        let g = Double((int >> 8) & 0xFF) / 255.0
-        let b = Double(int & 0xFF) / 255.0
-        self.init(red: r, green: g, blue: b)
+        let r = CGFloat((int >> 16) & 0xFF) / 255.0
+        let g = CGFloat((int >> 8) & 0xFF) / 255.0
+        let b = CGFloat(int & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b, alpha: 1.0)
     }
 }
