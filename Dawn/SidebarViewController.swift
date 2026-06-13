@@ -4,6 +4,7 @@ import Combine
 // MARK: - Sidebar Delegate Protocol
 
 protocol SidebarDelegate: AnyObject {
+    var currentTabId: UUID? { get }
     func sidebarDidSelectTab(_ tab: Tab)
     func sidebarDidRequestCloseTab(_ tab: Tab)
     func sidebarDidRequestNewTab()
@@ -13,6 +14,13 @@ protocol SidebarDelegate: AnyObject {
     func sidebarDidRequestReload()
     func sidebarDidSubmitURL(_ url: String)
     func sidebarDidReorderTabs(_ orderedTabIds: [UUID])
+    // Drop landed outside this window's list: commit the move and return the destination window's
+    // sidebar to adopt the live pile (cross-window / tear-off), or nil to spring the pile home.
+    func sidebarHandOffPile(_ ids: [UUID], at screenPoint: CGPoint) -> SidebarViewController?
+    // The pile moved (screen coords): reveal / make space in whatever window the cursor is over.
+    func sidebarTabDragMoved(toScreen screenPoint: CGPoint, ids: [UUID])
+    // The drag ended: clear any cross-window reveal / gap.
+    func sidebarTabDragEnded()
 }
 
 // MARK: - Sidebar View Controller
@@ -58,6 +66,12 @@ class SidebarViewController: NSViewController {
     // follow the cursor, while each card springs from its list slot into the pile on pickup and back
     // out to its new slot on drop. A single tab is just a pile of one. nil when no drag is running.
     private var drag: DragSession?
+
+    // A pile dragged from ANOTHER window hovering this list (cross-window drop): the slot the incoming
+    // tabs would land at, opening a make-space gap. nil when no foreign pile is over this list.
+    private var foreignDragActive = false
+    private var foreignGapSlot: Int?
+    private var foreignGap: Int? { foreignDragActive ? foreignGapSlot : nil }
 
     private final class DragSession {
         let ids: [UUID]               // tabs being dragged, in list order
@@ -384,6 +398,7 @@ class SidebarViewController: NSViewController {
     private func layoutTabCells(animated: Bool = false) {
         let m = tabMetrics()
 
+        let foreignGapIndex = self.foreignGap
         let excluded = self.reorderExcludedIds
         let apply = {
             if !excluded.isEmpty {
@@ -407,6 +422,15 @@ class SidebarViewController: NSViewController {
                         )
                     }
                 }
+            } else if let gap = foreignGapIndex {
+                // A pile from another window is hovering this list: open a single gap at `gap` so the
+                // incoming tabs land there, exactly like an in-window make-space.
+                for (index, tab) in self.tabs.enumerated() {
+                    let slot = index >= gap ? index + 1 : index
+                    self.tabCellViews[tab.id]?.frame = NSRect(
+                        x: m.padH, y: m.slotY(slot), width: m.cellW, height: m.cellH
+                    )
+                }
             } else {
                 for (index, tab) in self.tabs.enumerated() {
                     self.tabCellViews[tab.id]?.frame = NSRect(
@@ -427,7 +451,7 @@ class SidebarViewController: NSViewController {
             apply()
         }
 
-        let totalH = m.slotY(tabs.count) + m.padV
+        let totalH = m.slotY(tabs.count + (foreignGapIndex != nil ? 1 : 0)) + m.padV
         tabListView.frame = NSRect(x: 0, y: 0, width: m.width, height: max(totalH, scrollView.frame.height))
     }
 
@@ -463,12 +487,12 @@ class SidebarViewController: NSViewController {
     func updateTab(_ tabId: UUID) {
         guard let cell = tabCellViews[tabId],
               let tab = tabs.first(where: { $0.id == tabId }) else { return }
-        cell.update(tab: tab, isSelected: tabManager.currentTabId == tab.id)
+        cell.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
     }
 
     func updateSelection() {
         for tab in tabs {
-            tabCellViews[tab.id]?.update(tab: tab, isSelected: tabManager.currentTabId == tab.id)
+            tabCellViews[tab.id]?.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
         }
     }
 
@@ -524,13 +548,81 @@ class SidebarViewController: NSViewController {
     }
 
     private func tabDragEnded(_ cell: TabCellView, _ event: NSEvent) {
-        guard let drag = drag else { return }
-        pileDragEnded(commit: drag.overBar)   // over the list -> reorder; elsewhere -> spring home
+        guard let drag = drag, let window = view.window else { return }
+        let screenPoint = window.convertPoint(toScreen: event.locationInWindow)
+        delegate?.sidebarTabDragEnded()   // clear cross-window reveal / gaps, whatever the outcome
+
+        // Dropped on my own list -> the standard reorder drop, right here.
+        if drag.overBar {
+            pileDragEnded(commit: true)
+            return
+        }
+        // Dropped over another window's list / outside all windows: the manager commits the model move
+        // and hands back the destination sidebar, which adopts THIS live pile and runs the exact same
+        // drop. So every window catches a dropped pile identically. nil -> nothing valid: spring home.
+        if let dest = delegate?.sidebarHandOffPile(drag.ids, at: screenPoint), dest !== self {
+            self.drag = nil               // ownership of the overlay + cards transfers to dest
+            dest.adoptPile(drag)
+            return
+        }
+        pileDragEnded(commit: false)      // spring back to where the tabs started
+    }
+
+    // Catch a live pile handed off from another window (or a freshly torn-off one). The dragged tabs
+    // already belong to this window's model now, so run the identical drop: scatter the cards into our
+    // slots and dissolve them into the real cells. This is why a cross-window drop looks exactly like an
+    // in-window one - it IS the same code, just on the window the pile landed on.
+    private func adoptPile(_ session: DragSession) {
+        clearForeignDrag()
+        drag = session
+        for id in session.ids { tabCellViews[id]?.alphaValue = 0 }   // the scatter dissolves into them
+        pileDragEnded(commit: false)   // the move is already committed; just animate into place
+    }
+
+    // The slot the dragged tabs would insert at if dropped over this list, else nil (point not over it).
+    func tabListInsertionIndex(atScreen screenPoint: CGPoint) -> Int? {
+        guard let window = view.window else { return nil }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        guard scrollView.frame.contains(view.convert(windowPoint, from: nil)) else { return nil }
+        let m = tabMetrics()
+        let listY = tabListView.convert(windowPoint, from: nil).y
+        return max(0, min(Int(((listY - m.slotY(0)) / m.rowH).rounded()), tabs.count))
+    }
+
+    // MARK: - Foreign drag (a pile from another window hovering this one)
+
+    func beginForeignDrag() {
+        foreignDragActive = true
+        foreignGapSlot = nil
+        layoutTabCells(animated: true)
+    }
+
+    func updateForeignGap(_ slot: Int?) {
+        guard foreignDragActive, slot != foreignGapSlot else { return }
+        foreignGapSlot = slot
+        layoutTabCells(animated: true)
+    }
+
+    func endForeignDrag() {
+        guard foreignDragActive else { return }
+        foreignDragActive = false
+        foreignGapSlot = nil
+        layoutTabCells(animated: true)
+    }
+
+    // Drop the phantom-gap flag without re-laying-out (the real moved cells take over immediately).
+    func clearForeignDrag() {
+        foreignDragActive = false
+        foreignGapSlot = nil
     }
 
     private func beginPileDrag(grabbed cell: TabCellView, ids: [UUID]) {
-        guard let window = view.window, let screen = window.screen ?? NSScreen.main else { return }
-        let screenFrame = screen.frame
+        guard let window = view.window else { return }
+        // Span every display so the pile stays visible across monitors: the whole gesture works in
+        // global screen coordinates already, so one canvas over the union of all screens is all it
+        // takes. Computed once here, so it just scales to however many monitors are attached.
+        let screenFrame = NSScreen.screens.reduce(NSRect.null) { $0.union($1.frame) }
+        guard !screenFrame.isEmpty else { return }
         let m = tabMetrics()
         let cardSize = CGSize(width: m.cellW, height: m.cellH)
         let idSet = Set(ids)
@@ -661,6 +753,8 @@ class SidebarViewController: NSViewController {
         drag.container.layer?.transform = CATransform3DMakeTranslation(cursor.x - drag.pickupCursor.x, cursor.y - drag.pickupCursor.y, 0)
         CATransaction.commit()
         updateMakeSpaceGap(windowPoint: window.convertPoint(fromScreen: cursor))
+        // Let the window manager reveal / make space in whatever window the cursor is over.
+        delegate?.sidebarTabDragMoved(toScreen: cursor, ids: drag.ids)
     }
 
     // The other cells open a single-tab gap at the slot the cursor hovers over (or close it when the
@@ -791,7 +885,9 @@ class SidebarViewController: NSViewController {
         panel.ignoresMouseEvents = true
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.transient, .ignoresCycle, .fullScreenAuxiliary]
+        // canJoinAllSpaces so the union-of-screens panel renders on every display even with "Displays
+        // have separate Spaces" on (the default).
+        panel.collectionBehavior = [.transient, .ignoresCycle, .fullScreenAuxiliary, .canJoinAllSpaces]
         return panel
     }
 
@@ -840,7 +936,7 @@ class SidebarViewController: NSViewController {
             card.addSubview(shade)
         }
 
-        let ghost = TabCellView(tab: tab, isSelected: tabManager.currentTabId == tab.id)
+        let ghost = TabCellView(tab: tab, isSelected: delegate?.currentTabId == tab.id)
         ghost.isDragGhost = true
         ghost.appearance = appearance
         ghost.frame = card.bounds
@@ -869,7 +965,7 @@ class SidebarViewController: NSViewController {
             selectionAnchorId = tab.id
             updateSelectionHighlights()
         } else if modifiers.contains(.shift) {
-            let anchor = selectionAnchorId ?? tabManager.currentTabId
+            let anchor = selectionAnchorId ?? delegate?.currentTabId
             if let a = tabs.firstIndex(where: { $0.id == anchor }),
                let b = tabs.firstIndex(where: { $0.id == tab.id }) {
                 let range = a <= b ? a...b : b...a
@@ -892,7 +988,7 @@ class SidebarViewController: NSViewController {
         // when there's a real multi-selection (other tabs too), so a lone active tab keeps its 0.1.
         let isMulti = selectedTabIds.count > 1
         for (id, cell) in tabCellViews {
-            if id == tabManager.currentTabId {
+            if id == delegate?.currentTabId {
                 cell.isInSelection = isMulti && selectedTabIds.contains(id)
             } else {
                 cell.isInSelection = selectedTabIds.contains(id)
@@ -939,7 +1035,7 @@ class SidebarViewController: NSViewController {
             if let existing = tabCellViews[tab.id] {
                 cell = existing
             } else {
-                cell = TabCellView(tab: tab, isSelected: tabManager.currentTabId == tab.id)
+                cell = TabCellView(tab: tab, isSelected: delegate?.currentTabId == tab.id)
                 cell.onSelect = { [weak self, weak tab] modifiers in
                     guard let tab = tab else { return }
                     self?.handleTabClick(tab, modifiers: modifiers)
@@ -960,7 +1056,7 @@ class SidebarViewController: NSViewController {
                 }
                 tabCellViews[tab.id] = cell
             }
-            cell.update(tab: tab, isSelected: tabManager.currentTabId == tab.id)
+            cell.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
             tabListView.addSubview(cell)
         }
 

@@ -4,6 +4,9 @@ import Combine
 
 class WebContentViewController: NSViewController {
     let tabManager: TabManager
+    // The settings page routes these to the owning window (window-scoped operations).
+    var onOpenURLInNewTab: ((String) -> Void)?
+    var onUpdateSettingsPath: ((String) -> Void)?
     let historyManager: HistoryManager
 
     private var backgroundColorView: NSView!
@@ -242,14 +245,10 @@ class WebContentViewController: NSViewController {
 
         let vc = SettingsViewController(historyManager: historyManager)
         vc.navigationState.onNavigate = { [weak self] path in
-            self?.tabManager.updateSettingsPath(path)
+            self?.onUpdateSettingsPath?(path)
         }
         vc.onOpenURL = { [weak self] url in
-            guard let self = self else { return }
-            self.tabManager.createTab(
-                url: url,
-                existingCount: self.tabManager.fetchTabs().count
-            )
+            self?.onOpenURLInNewTab?(url)
         }
 
         let container = vc.view

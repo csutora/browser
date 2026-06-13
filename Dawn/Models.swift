@@ -23,6 +23,9 @@ final class Tab: Identifiable {
     var zoomScale: Double = 1.0
     var backgroundColorHex: String?
     var lastAccessedAt: Date = Date()
+    // The window this tab belongs to. Inverse of WindowModel.tabs; nil only for legacy tabs before
+    // the multi-window migration adopts them. sortIndex orders tabs within their window.
+    var window: WindowModel?
 
     var tabType: TabType {
         get { TabType(rawValue: tabTypeRaw) ?? .web }
@@ -51,6 +54,44 @@ extension Tab: Equatable {
     }
 }
 
+// MARK: - Window Model
+
+// One browser window: owns its tabs (cascade-deleted with it), remembers its current tab and its
+// on-screen frame, and orders itself among windows for restore. sortIndex orders tabs within it.
+@Model
+final class WindowModel {
+    @Attribute(.unique) var id: UUID
+    var orderIndex: Int
+    var currentTabIdString: String
+    var isDocked: Bool = true
+    var frameX: Double
+    var frameY: Double
+    var frameW: Double
+    var frameH: Double
+    @Relationship(deleteRule: .cascade, inverse: \Tab.window) var tabs: [Tab]
+
+    var currentTabId: UUID? {
+        get { UUID(uuidString: currentTabIdString) }
+        set { currentTabIdString = newValue?.uuidString ?? "" }
+    }
+
+    var frame: NSRect {
+        get { NSRect(x: frameX, y: frameY, width: frameW, height: frameH) }
+        set { frameX = newValue.minX; frameY = newValue.minY; frameW = newValue.width; frameH = newValue.height }
+    }
+
+    init(id: UUID = UUID(), orderIndex: Int = 0, frame: NSRect = .zero) {
+        self.id = id
+        self.orderIndex = orderIndex
+        self.currentTabIdString = ""
+        self.frameX = frame.minX
+        self.frameY = frame.minY
+        self.frameW = frame.width
+        self.frameH = frame.height
+        self.tabs = []
+    }
+}
+
 // MARK: - Closed Tab Info (for reopen stack)
 struct ClosedTabInfo: Codable {
     let title: String
@@ -62,46 +103,20 @@ struct ClosedTabInfo: Codable {
 }
 
 // MARK: - Tab Manager
+//
+// Store service for the SwiftData tab/window store. Tab operations are window-scoped (they take a
+// WindowModel); the owning MainWindowController drives its own refresh afterwards, so there's no
+// global "tabs changed" broadcast. The current tab lives on the WindowModel, not here.
 class TabManager: ObservableObject {
-    @Published var currentTabIdString: String = UserDefaults.standard.string(forKey: "currentTabId") ?? "" {
-        didSet { UserDefaults.standard.set(currentTabIdString, forKey: "currentTabId") }
-    }
     var modelContext: ModelContext?
     private var saveTask: DispatchWorkItem?
 
-    /// Stack of recently closed tabs (most recent last)
-    private var closedTabsStack: [ClosedTabInfo] = [] {
-        didSet { saveClosedTabsStack() }
-    }
+    // Recently-closed tabs per window (most recent last), in-memory for the session.
+    private var closedTabsByWindow: [UUID: [ClosedTabInfo]] = [:]
     private let maxClosedTabs = 20
-    private let closedTabsKey = "closedTabsStack"
 
-    init() {
-        loadClosedTabsStack()
-    }
-
-    private func saveClosedTabsStack() {
-        if let encoded = try? JSONEncoder().encode(closedTabsStack) {
-            UserDefaults.standard.set(encoded, forKey: closedTabsKey)
-        }
-    }
-
-    private func loadClosedTabsStack() {
-        if let data = UserDefaults.standard.data(forKey: closedTabsKey),
-           let decoded = try? JSONDecoder().decode([ClosedTabInfo].self, from: data) {
-            closedTabsStack = decoded
-        }
-    }
-
-    var currentTabId: UUID? {
-        get { UUID(uuidString: currentTabIdString) }
-        set { currentTabIdString = newValue?.uuidString ?? "" }
-    }
-
-    @Published var currentTabURL: String = ""
-
-    var canReopenClosedTab: Bool {
-        !closedTabsStack.isEmpty
+    func canReopenClosedTab(in window: WindowModel) -> Bool {
+        !(closedTabsByWindow[window.id]?.isEmpty ?? true)
     }
 
     func scheduleSave() {
@@ -116,121 +131,114 @@ class TabManager: ObservableObject {
         try? modelContext?.save()
     }
 
+    // All tabs across every window (used at quit to persist interaction state).
     func fetchTabs() -> [Tab] {
         let descriptor = FetchDescriptor<Tab>(sortBy: [SortDescriptor(\.sortIndex)])
         return (try? modelContext?.fetch(descriptor)) ?? []
     }
 
-    func createTab(url: String = "https://www.google.com", existingCount: Int, switchToTab: Bool = false) {
-        guard let context = modelContext else { return }
-        let t = Tab(url: url, sortIndex: existingCount)
-        context.insert(t)
-        if switchToTab {
-            currentTabId = t.id
-            currentTabURL = t.url
-        }
-        try? context.save()
-        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
+    func orderedTabs(in window: WindowModel) -> [Tab] {
+        window.tabs.sorted { $0.sortIndex < $1.sortIndex }
     }
 
-    func closeTab(_ tab: Tab, allTabs: [Tab], interactionState: Data? = nil) {
+    // Multi-window bootstrap: make sure at least one window exists and every tab belongs to one.
+    // Legacy stores (pre-window) have all tabs with window == nil; they get adopted into one window
+    // that inherits the old global current tab (from UserDefaults). Run once at launch.
+    func ensureDefaultWindow() {
         guard let context = modelContext else { return }
-
-        // Save tab info to closed stack before deleting (skip settings tabs)
-        if !tab.isSettings {
-            let closedInfo = ClosedTabInfo(
-                title: tab.title,
-                url: tab.url,
-                sortIndex: tab.sortIndex,
-                tabType: tab.tabType,
-                backgroundColorHex: tab.backgroundColorHex,
-                interactionState: interactionState
-            )
-            closedTabsStack.append(closedInfo)
-            if closedTabsStack.count > maxClosedTabs {
-                closedTabsStack.removeFirst()
+        let windows = (try? context.fetch(FetchDescriptor<WindowModel>())) ?? []
+        if let first = windows.min(by: { $0.orderIndex < $1.orderIndex }) {
+            let orphans = (try? context.fetch(FetchDescriptor<Tab>(predicate: #Predicate { $0.window == nil }))) ?? []
+            guard !orphans.isEmpty else { return }
+            for tab in orphans { tab.window = first }
+        } else {
+            let win = WindowModel(orderIndex: 0)
+            context.insert(win)
+            for tab in fetchTabs() { tab.window = win }
+            win.currentTabId = UserDefaults.standard.string(forKey: "currentTabId").flatMap { UUID(uuidString: $0) }
+            if UserDefaults.standard.object(forKey: "isDocked") != nil {
+                win.isDocked = UserDefaults.standard.bool(forKey: "isDocked")
             }
         }
+        try? context.save()
+    }
 
-        if currentTabId == tab.id {
-            if let index = allTabs.firstIndex(of: tab) {
-                let newIndex = index > 0 ? index - 1 : (index + 1 < allTabs.count ? index + 1 : -1)
-                if newIndex >= 0 {
-                    let newTab = allTabs[newIndex]
-                    currentTabId = newTab.id
-                    currentTabURL = newTab.url
-                } else {
-                    currentTabId = nil
-                }
-            }
+    @discardableResult
+    func createTab(in window: WindowModel, url: String = "https://www.google.com", switchTo: Bool = false) -> Tab {
+        let t = Tab(url: url, sortIndex: window.tabs.count)
+        modelContext?.insert(t)
+        t.window = window
+        if switchTo { window.currentTabId = t.id }
+        try? modelContext?.save()
+        return t
+    }
+
+    func closeTab(_ tab: Tab, in window: WindowModel, interactionState: Data? = nil) {
+        guard let context = modelContext else { return }
+        let closedId = tab.id
+
+        if !tab.isSettings {
+            var stack = closedTabsByWindow[window.id] ?? []
+            stack.append(ClosedTabInfo(
+                title: tab.title, url: tab.url, sortIndex: tab.sortIndex,
+                tabType: tab.tabType, backgroundColorHex: tab.backgroundColorHex,
+                interactionState: interactionState
+            ))
+            if stack.count > maxClosedTabs { stack.removeFirst() }
+            closedTabsByWindow[window.id] = stack
+        }
+
+        let ordered = orderedTabs(in: window)
+        if window.currentTabId == closedId, let index = ordered.firstIndex(where: { $0.id == closedId }) {
+            let newIndex = index > 0 ? index - 1 : (index + 1 < ordered.count ? index + 1 : -1)
+            window.currentTabId = newIndex >= 0 ? ordered[newIndex].id : nil
         }
         context.delete(tab)
+        for (i, t) in ordered.filter({ $0.id != closedId }).enumerated() { t.sortIndex = i }
         try? context.save()
-        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
     }
 
-    func reopenLastClosedTab(existingCount: Int) {
-        guard let context = modelContext, let closedInfo = closedTabsStack.popLast() else { return }
+    @discardableResult
+    func reopenLastClosedTab(in window: WindowModel) -> Tab? {
+        guard let context = modelContext, var stack = closedTabsByWindow[window.id], let info = stack.popLast() else { return nil }
+        closedTabsByWindow[window.id] = stack
 
-        let tab = Tab(
-            title: closedInfo.title,
-            url: closedInfo.url,
-            sortIndex: existingCount,
-            tabType: closedInfo.tabType
-        )
-        tab.backgroundColorHex = closedInfo.backgroundColorHex
-        tab.interactionState = closedInfo.interactionState
-
-        context.insert(tab)
-        currentTabId = tab.id
-        currentTabURL = tab.url
+        let t = Tab(title: info.title, url: info.url, sortIndex: window.tabs.count, tabType: info.tabType)
+        t.backgroundColorHex = info.backgroundColorHex
+        t.interactionState = info.interactionState
+        context.insert(t)
+        t.window = window
+        window.currentTabId = t.id
         try? context.save()
-        NotificationCenter.default.post(name: .tabsDidChange, object: nil)
+        return t
     }
 
-    func selectTab(_ tab: Tab) {
-        currentTabId = tab.id
-        currentTabURL = tab.url
-        updateLastAccessedAt(for: tab.id)
+    func selectTab(_ tab: Tab, in window: WindowModel) {
+        window.currentTabId = tab.id
+        tab.lastAccessedAt = Date()
+        scheduleSave()
     }
 
-    private func updateLastAccessedAt(for tabId: UUID) {
-        guard let context = modelContext else { return }
-        let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == tabId })
-        if let tab = try? context.fetch(descriptor).first {
-            tab.lastAccessedAt = Date()
+    @discardableResult
+    func openSettings(in window: WindowModel) -> Tab {
+        if let settings = orderedTabs(in: window).first(where: { $0.isSettings }) {
+            window.currentTabId = settings.id
             scheduleSave()
+            return settings
         }
+        let t = Tab(title: "Settings", url: "dawn://settings", sortIndex: window.tabs.count, tabType: .settings)
+        modelContext?.insert(t)
+        t.window = window
+        window.currentTabId = t.id
+        try? modelContext?.save()
+        return t
     }
 
-    func updateSettingsPath(_ path: String) {
-        guard let context = modelContext,
-              let currentId = currentTabId else { return }
-        let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == currentId })
-        if let tab = try? context.fetch(descriptor).first, tab.isSettings {
-            let newURL = "dawn://\(path)"
-            tab.url = newURL
-            currentTabURL = newURL
-            try? context.save()
-        }
-    }
-
-    func openSettings() {
-        guard let context = modelContext else { return }
-
-        let descriptor = FetchDescriptor<Tab>(sortBy: [SortDescriptor(\.sortIndex)])
-        let allTabs = (try? context.fetch(descriptor)) ?? []
-
-        if let settingsTab = allTabs.first(where: { $0.isSettings }) {
-            selectTab(settingsTab)
-        } else {
-            let t = Tab(title: "Settings", url: "dawn://settings", sortIndex: allTabs.count, tabType: .settings)
-            context.insert(t)
-            currentTabId = t.id
-            currentTabURL = "dawn://settings"
-            try? context.save()
-            NotificationCenter.default.post(name: .tabsDidChange, object: nil)
-        }
+    func updateSettingsPath(_ path: String, in window: WindowModel) {
+        guard let currentId = window.currentTabId,
+              let tab = orderedTabs(in: window).first(where: { $0.id == currentId }), tab.isSettings else { return }
+        tab.url = "dawn://\(path)"
+        try? modelContext?.save()
     }
 
     func updateTab(_ id: UUID, title: String? = nil, url: String? = nil, scroll: CGPoint? = nil, backgroundColorHex: String? = nil) {
@@ -238,10 +246,7 @@ class TabManager: ObservableObject {
         let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.id == id })
         if let tab = try? context.fetch(descriptor).first {
             if let t = title { tab.title = t }
-            if let u = url {
-                tab.url = u
-                if id == currentTabId { currentTabURL = u }
-            }
+            if let u = url { tab.url = u }
             if let s = scroll {
                 tab.scrollX = s.x
                 tab.scrollY = s.y

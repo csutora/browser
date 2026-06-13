@@ -7,8 +7,66 @@ class MainWindowController: NSWindowController {
     let tabManager: TabManager
     let historyManager: HistoryManager
     let modelContext: ModelContext
+    let windowModel: WindowModel
+    weak var windowManager: WindowManager?
 
-    let mouseTracker = MouseTracker()
+    // This window's current tab, persisted on the window model.
+    var currentTabId: UUID? { windowModel.currentTabId }
+
+    // The current tab's live URL (web view if any, else the stored url) - for the URL bar / copy.
+    var currentTabURL: String {
+        if let id = currentTabId, let live = browserStates[id]?.currentURL?.absoluteString { return live }
+        return currentTab?.url ?? ""
+    }
+
+    var currentTab: Tab? {
+        guard let id = currentTabId else { return nil }
+        return tabs.first(where: { $0.id == id })
+    }
+
+    // Set by the WindowManager: called when this window closes (user close or app quit).
+    var onWindowClose: (() -> Void)?
+
+    // Save this window's on-screen frame to its model for session restore.
+    func persistFrame() {
+        if let f = window?.frame { windowModel.frame = f }
+    }
+
+    // If the screen point is over this window's tab list, the slot tabs would insert at (else nil).
+    func tabListInsertionIndex(atScreen screenPoint: CGPoint) -> Int? {
+        sidebarVC?.tabListInsertionIndex(atScreen: screenPoint)
+    }
+
+    // A pile from another window is hovering this one: open a make-space gap (the sidebar reveal is
+    // handled by the shared hover monitor, since the drag emits mouse-dragged events).
+    func beginForeignTabDrag() {
+        sidebarVC?.beginForeignDrag()
+    }
+
+    func updateForeignTabGap(atScreen screenPoint: CGPoint) {
+        sidebarVC?.updateForeignGap(sidebarVC?.tabListInsertionIndex(atScreen: screenPoint))
+    }
+
+    func endForeignTabDrag() {
+        sidebarVC?.endForeignDrag()
+    }
+
+    func clearForeignTabDrag() {
+        sidebarVC?.clearForeignDrag()
+    }
+
+    var sidebar: SidebarViewController? { sidebarVC }
+
+    // Capture each tab's web-view interaction state into its model, so a later restore (reopen of a
+    // kept last window, or relaunch) brings the page back with its history/scroll, not a bare reload.
+    func persistInteractionState() {
+        for (id, state) in browserStates {
+            guard let data = state.captureInteractionState(),
+                  let tab = tabs.first(where: { $0.id == id }) else { continue }
+            tab.interactionState = data
+        }
+    }
+
     let keybindHandler = KeybindHandler.shared
     let commandPaletteState = CommandPaletteState()
 
@@ -42,10 +100,12 @@ class MainWindowController: NSWindowController {
 
     // MARK: - Settings
 
+    // Per-window dock state (persisted on the window model).
     var isDocked: Bool {
-        get { UserDefaults.standard.bool(forKey: "isDocked") }
+        get { windowModel.isDocked }
         set {
-            UserDefaults.standard.set(newValue, forKey: "isDocked")
+            windowModel.isDocked = newValue
+            tabManager.scheduleSave()
             sidebarVC?.updateDockState(newValue)
         }
     }
@@ -62,10 +122,40 @@ class MainWindowController: NSWindowController {
 
     // MARK: - Computed
 
+    // Driven by the shared hover monitor (one listener across all windows): true while the cursor is
+    // near this undocked window's sidebar edge and this window is the one under the cursor.
+    var hoverSidebarOpen = false {
+        didSet {
+            guard oldValue != hoverSidebarOpen else { return }
+            handleFloatingVisibilityChange()
+        }
+    }
+
     var isFloatingVisible: Bool {
         if isDocked { return false }
         if isResizing { return true }
-        return mouseTracker.shouldShowSidebar
+        return hoverSidebarOpen
+    }
+
+    // Called by the shared hover monitor with the cursor's last and current positions. Open this
+    // (undocked) window's sidebar when that segment crosses a trigger line just inside the left edge -
+    // line-crossing rather than zone-testing, so a fast flick can't skip it and parking next to a
+    // neighbour (whose line the cursor never crosses) can't bleed it open. Once open it holds until the
+    // cursor leaves a wide band: too far left (overshoot done) or right into the content.
+    func updateHover(from prev: NSPoint, to cur: NSPoint) {
+        guard !isDocked, let frame = window?.frame else {
+            hoverSidebarOpen = false
+            return
+        }
+        let triggerLine = frame.minX + 8
+        let withinHeight = cur.y >= frame.minY && cur.y <= frame.maxY
+        let crossed = withinHeight && ((prev.x > triggerLine) != (cur.x > triggerLine))
+        if crossed { hoverSidebarOpen = true }
+
+        let x = cur.x - frame.minX
+        if hoverSidebarOpen, !withinHeight || x < -150 || x >= CGFloat(sidebarWidth) + 30 {
+            hoverSidebarOpen = false
+        }
     }
 
     var sidebarOffset: CGFloat {
@@ -74,26 +164,24 @@ class MainWindowController: NSWindowController {
 
     // MARK: - Init
 
-    init(tabManager: TabManager, historyManager: HistoryManager, modelContext: ModelContext) {
+    init(tabManager: TabManager, historyManager: HistoryManager, modelContext: ModelContext, windowModel: WindowModel) {
         self.tabManager = tabManager
         self.historyManager = historyManager
         self.modelContext = modelContext
+        self.windowModel = windowModel
 
         let window = Self.createWindow()
         super.init(window: window)
 
         setupViews()
         setupObservers()
-        setupKeybindHandler()
 
         commandPaletteState.historyManager = historyManager
 
         loadTabs()
 
-        if tabManager.currentTabId == nil {
-            if let first = tabs.first {
-                tabManager.selectTab(first)
-            }
+        if currentTabId == nil, let first = tabs.first {
+            windowModel.currentTabId = first.id   // switch itself is deferred to showWindow()
         }
 
         sidebarVC.reloadTabs(tabs)
@@ -136,8 +224,12 @@ class MainWindowController: NSWindowController {
         window.backgroundColor = .clear
         window.hasShadow = true
         window.isMovableByWindowBackground = true
+        // Needed for the sidebar hover-reveal: without it macOS delivers no mouse-moved events to the
+        // window, so a window that becomes key (e.g. via cmd-`) would stop responding to hover.
+        window.acceptsMouseMovedEvents = true
         window.center()
-        window.setFrameAutosaveName("MainWindow")
+        // No frame autosave: multiple windows would all share one saved frame (and overlap). Frames
+        // are persisted per window via WindowModel instead.
         window.minSize = NSSize(width: 600, height: 400)
         return window
     }
@@ -176,6 +268,11 @@ class MainWindowController: NSWindowController {
 
         // Web content VC
         webContentVC = WebContentViewController(tabManager: tabManager, historyManager: historyManager)
+        webContentVC.onOpenURLInNewTab = { [weak self] url in self?.createTab(url: url, switchTo: true) }
+        webContentVC.onUpdateSettingsPath = { [weak self] path in
+            guard let self = self else { return }
+            self.tabManager.updateSettingsPath(path, in: self.windowModel)
+        }
         webContentVC.view.autoresizingMask = [.width, .height]
         contentContainer.addSubview(webContentVC.view)
 
@@ -205,7 +302,6 @@ class MainWindowController: NSWindowController {
         resizeHandle.onDragUpdate = { [weak self] delta in
             guard let self = self, let start = self.dragStartWidth else { return }
             self.sidebarWidth = max(220, min(600, start + Double(delta)))
-            self.mouseTracker.updateSettings(sidebarWidth: self.sidebarWidth, isDocked: self.isDocked)
             self.layoutSubviews()
         }
         resizeHandle.onDragEnd = { [weak self] in
@@ -293,37 +389,14 @@ class MainWindowController: NSWindowController {
     // MARK: - Observers
 
     private func setupObservers() {
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(tabsDidChange),
-            name: .tabsDidChange, object: nil
-        )
-
+        // Per-tab data updates (title/url/bg) can come from any window's web view; only react to tabs
+        // this window owns. Structural changes (create/close/reorder) are driven directly, no notif.
         NotificationCenter.default.addObserver(
             self, selector: #selector(tabDataDidChange(_:)),
             name: .tabDataDidChange, object: nil
         )
 
-        tabManager.$currentTabIdString.sink { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.handleTabSwitch()
-            }
-        }.store(in: &cancellables)
-
-        tabManager.$currentTabURL.sink { [weak self] url in
-            self?.sidebarVC?.updateURLBar(url)
-        }.store(in: &cancellables)
-
-        // @Published emits in willSet (before the stored value updates), so a synchronous
-        // sink that re-reads shouldShowSidebar would see the previous value. Hop to the main
-        // queue so the assignment has committed before we read it back through sidebarOffset.
-        mouseTracker.$shouldShowSidebar
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleFloatingVisibilityChange()
-            }.store(in: &cancellables)
-
-        mouseTracker.window = window
-        mouseTracker.updateSettings(sidebarWidth: sidebarWidth, isDocked: isDocked)
+        // Sidebar hover is driven by the shared hover monitor (WindowManager) via updateHover().
 
         // Fullscreen border: flip the layout at the start of the transition in both directions, so
         // the target state is baked in while the window zooms behind the system snapshot and is
@@ -340,9 +413,17 @@ class MainWindowController: NSWindowController {
             self, selector: #selector(willExitFullScreen),
             name: NSWindow.willExitFullScreenNotification, object: window
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowWillCloseNotif),
+            name: NSWindow.willCloseNotification, object: window
+        )
     }
 
-    @objc private func tabsDidChange() {
+    @objc private func windowWillCloseNotif() { onWindowClose?() }
+
+    // Re-read this window's tabs from the model and rebuild views. Called by the window's own tab
+    // operations (the structural counterpart to the old global .tabsDidChange).
+    func refreshTabs() {
         loadTabs()
         syncStates()
         sidebarVC.reloadTabs(tabs)
@@ -350,20 +431,19 @@ class MainWindowController: NSWindowController {
     }
 
     @objc private func tabDataDidChange(_ notification: Notification) {
-        if let tabId = notification.object as? UUID {
-            sidebarVC.updateTab(tabId)
-        }
+        guard let tabId = notification.object as? UUID, tabs.contains(where: { $0.id == tabId }) else { return }
+        sidebarVC.updateTab(tabId)
         updateWindowTitle()
     }
 
-    private func handleTabSwitch() {
+    func handleTabSwitch() {
         webContentVC.switchToTab(
-            tabManager.currentTabId,
+            currentTabId,
             browserStates: browserStates,
             tabs: tabs
         )
         sidebarVC.updateSelection()
-        sidebarVC.updateNavState(for: browserStates[tabManager.currentTabId ?? UUID()])
+        sidebarVC.updateNavState(for: browserStates[currentTabId ?? UUID()])
         observeCurrentBrowserState()
         updateWindowTitle()
     }
@@ -371,8 +451,18 @@ class MainWindowController: NSWindowController {
     private func observeCurrentBrowserState() {
         browserStateCancellables.removeAll()
 
-        guard let currentId = tabManager.currentTabId,
-              let state = browserStates[currentId] else { return }
+        // Drive the URL bar from the current tab: live web-view URL, or the stored url for a settings
+        // tab / before the web view exists.
+        sidebarVC.updateURLBar(currentTabURL)
+
+        guard let currentId = currentTabId, let state = browserStates[currentId] else { return }
+
+        state.$currentURL
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] url in
+                self?.sidebarVC.updateURLBar(url?.absoluteString ?? self?.currentTab?.url ?? "")
+            }
+            .store(in: &browserStateCancellables)
 
         Publishers.CombineLatest3(state.$canGoBack, state.$canGoForward, state.$isLoading)
             .sink { [weak self, weak state] _, _, _ in
@@ -380,6 +470,46 @@ class MainWindowController: NSWindowController {
                 self?.sidebarVC.updateNavState(for: state)
             }
             .store(in: &browserStateCancellables)
+    }
+
+    // MARK: - Window-scoped tab operations
+
+    func selectTab(_ tab: Tab) {
+        tabManager.selectTab(tab, in: windowModel)
+        handleTabSwitch()
+    }
+
+    @discardableResult
+    func createTab(url: String = "https://www.google.com", switchTo: Bool = true) -> Tab {
+        let t = tabManager.createTab(in: windowModel, url: url, switchTo: switchTo)
+        refreshTabs()
+        if switchTo { handleTabSwitch() }
+        return t
+    }
+
+    func closeTab(_ tab: Tab) {
+        let interactionState = browserStates[tab.id]?.captureInteractionState()
+        tabManager.closeTab(tab, in: windowModel, interactionState: interactionState)
+        if windowModel.tabs.isEmpty {
+            // Last tab closed: close the window (deferred so this call can unwind before the window
+            // - and this controller - go away). The app stays alive even with no windows.
+            DispatchQueue.main.async { [weak self] in self?.window?.close() }
+            return
+        }
+        refreshTabs()
+        handleTabSwitch()
+    }
+
+    func reopenLastClosedTab() {
+        guard let t = tabManager.reopenLastClosedTab(in: windowModel) else { return }
+        refreshTabs()
+        selectTab(t)
+    }
+
+    func openSettings() {
+        _ = tabManager.openSettings(in: windowModel)
+        refreshTabs()
+        handleTabSwitch()
     }
 
     private func handleFloatingVisibilityChange() {
@@ -469,10 +599,10 @@ class MainWindowController: NSWindowController {
     // MARK: - Tab Management
 
     func loadTabs() {
-        tabs = tabManager.fetchTabs()
+        tabs = tabManager.orderedTabs(in: windowModel)
         if tabs.isEmpty {
-            tabManager.createTab(existingCount: 0, switchToTab: true)
-            tabs = tabManager.fetchTabs()
+            _ = tabManager.createTab(in: windowModel, switchTo: true)
+            tabs = tabManager.orderedTabs(in: windowModel)
         }
     }
 
@@ -488,12 +618,7 @@ class MainWindowController: NSWindowController {
                     interactionState: tab.interactionState
                 )
                 s.onNewTabRequested = { [weak self] url, switchToTab in
-                    guard let self = self else { return }
-                    self.tabManager.createTab(
-                        url: url.absoluteString,
-                        existingCount: self.tabs.count,
-                        switchToTab: switchToTab
-                    )
+                    self?.createTab(url: url.absoluteString, switchTo: switchToTab)
                 }
                 browserStates[tab.id] = s
             }
@@ -506,28 +631,20 @@ class MainWindowController: NSWindowController {
         webContentVC.syncWebViews(
             browserStates: browserStates,
             tabs: tabs,
-            currentTabId: tabManager.currentTabId
+            currentTabId: currentTabId
         )
     }
 
     func updateWindowTitle() {
         guard let window = self.window else { return }
-        guard let currentId = tabManager.currentTabId,
-              let currentTab = tabs.first(where: { $0.id == currentId }) else {
+        guard let tab = currentTab else {
             window.title = "Dawn"
             return
         }
-        window.title = currentTab.isSettings ? "Settings" : (currentTab.title.isEmpty ? "Untitled" : currentTab.title)
+        window.title = tab.isSettings ? "Settings" : (tab.title.isEmpty ? "Untitled" : tab.title)
     }
 
     // MARK: - Keybinds
-
-    private func setupKeybindHandler() {
-        keybindHandler.onAction = { [weak self] action in
-            self?.handleKeybindAction(action)
-        }
-        keybindHandler.start()
-    }
 
     func handleKeybindAction(_ action: KeybindAction) {
         if commandPaletteState.isVisible {
@@ -546,52 +663,49 @@ class MainWindowController: NSWindowController {
         switch action {
         case .newTab:
             let recentTabs = tabs
-                .filter { $0.id != tabManager.currentTabId }
+                .filter { $0.id != currentTabId }
                 .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
                 .prefix(5)
             commandPaletteState.show(mode: .newTab, recentTabs: Array(recentTabs))
             showCommandPalette()
 
         case .closeTab:
-            guard let currentId = tabManager.currentTabId,
-                  let tab = tabs.first(where: { $0.id == currentId }) else { return }
-            let interactionState = browserStates[currentId]?.captureInteractionState()
-            tabManager.closeTab(tab, allTabs: tabs, interactionState: interactionState)
+            if let tab = currentTab { closeTab(tab) }
 
         case .reopenClosedTab:
-            tabManager.reopenLastClosedTab(existingCount: tabs.count)
+            reopenLastClosedTab()
 
         case .refresh:
-            browserStates[tabManager.currentTabId ?? UUID()]?.reload()
+            browserStates[currentTabId ?? UUID()]?.reload()
 
         case .goBack:
-            browserStates[tabManager.currentTabId ?? UUID()]?.goBack()
+            browserStates[currentTabId ?? UUID()]?.goBack()
 
         case .goForward:
-            browserStates[tabManager.currentTabId ?? UUID()]?.goForward()
+            browserStates[currentTabId ?? UUID()]?.goForward()
 
         case .previousTab:
-            guard let currentId = tabManager.currentTabId,
+            guard let currentId = currentTabId,
                   let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
             let newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.count - 1
             if newIndex >= 0 && newIndex < tabs.count {
-                tabManager.selectTab(tabs[newIndex])
+                selectTab(tabs[newIndex])
             }
 
         case .nextTab:
-            guard let currentId = tabManager.currentTabId,
+            guard let currentId = currentTabId,
                   let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
             let newIndex = currentIndex < tabs.count - 1 ? currentIndex + 1 : 0
             if newIndex >= 0 && newIndex < tabs.count {
-                tabManager.selectTab(tabs[newIndex])
+                selectTab(tabs[newIndex])
             }
 
         case .focusURLBar:
             let recentTabs = tabs
-                .filter { $0.id != tabManager.currentTabId }
+                .filter { $0.id != currentTabId }
                 .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
                 .prefix(5)
-            commandPaletteState.show(mode: .navigate, currentURL: tabManager.currentTabURL, recentTabs: Array(recentTabs))
+            commandPaletteState.show(mode: .navigate, currentURL: currentTabURL, recentTabs: Array(recentTabs))
             showCommandPalette()
 
         case .toggleSidebar:
@@ -599,19 +713,19 @@ class MainWindowController: NSWindowController {
 
         case .copyURL:
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(tabManager.currentTabURL, forType: .string)
+            NSPasteboard.general.setString(currentTabURL, forType: .string)
 
         case .openSettings:
-            tabManager.openSettings()
+            openSettings()
 
         case .zoomIn:
-            browserStates[tabManager.currentTabId ?? UUID()]?.zoomIn()
+            browserStates[currentTabId ?? UUID()]?.zoomIn()
 
         case .zoomOut:
-            browserStates[tabManager.currentTabId ?? UUID()]?.zoomOut()
+            browserStates[currentTabId ?? UUID()]?.zoomOut()
 
         case .resetZoom:
-            browserStates[tabManager.currentTabId ?? UUID()]?.resetZoom()
+            browserStates[currentTabId ?? UUID()]?.resetZoom()
         }
     }
 
@@ -661,9 +775,8 @@ class MainWindowController: NSWindowController {
             // Apply the chrome state and run the area animation now (deferred so a grow doesn't
             // open up the area before the reflow has finished).
             if currentlyDocked {
-                self.mouseTracker.shouldShowSidebar = true
+                self.hoverSidebarOpen = true   // just undocked: reveal it now; hover takes over after
             }
-            self.mouseTracker.updateSettings(sidebarWidth: self.sidebarWidth, isDocked: self.isDocked)
             if let bg = self.sidebarContainer.subviews.first as? SidebarFloatingBackground {
                 bg.fullscreenSidebarRadius = self.fullscreenSidebarRadius
                 bg.isFullscreen = self.isFullscreen
@@ -732,7 +845,7 @@ class MainWindowController: NSWindowController {
                 self?.handleCommandPaletteSubmit(type)
             }
             panel.onSwitchToTab = { [weak self] tab in
-                self?.tabManager.selectTab(tab)
+                self?.selectTab(tab)
                 self?.commandPaletteState.hide()
                 self?.commandPalettePanel?.hide()
             }
@@ -763,23 +876,23 @@ class MainWindowController: NSWindowController {
         case .historyEntry(_, let url):
             urlToLoad = url
         case .recentTab(let tab):
-            tabManager.selectTab(tab)
+            selectTab(tab)
             return
         }
 
         if urlToLoad.lowercased().hasPrefix("dawn://") {
-            tabManager.openSettings()
+            openSettings()
             let path = String(urlToLoad.dropFirst("dawn://".count))
             if !path.isEmpty && path != "settings" {
-                tabManager.updateSettingsPath(path)
+                tabManager.updateSettingsPath(path, in: windowModel)
             }
             return
         }
 
         if mode == .newTab {
-            tabManager.createTab(url: urlToLoad, existingCount: tabs.count, switchToTab: true)
+            createTab(url: urlToLoad, switchTo: true)
         } else {
-            browserStates[tabManager.currentTabId ?? UUID()]?.loadURL(urlToLoad)
+            browserStates[currentTabId ?? UUID()]?.loadURL(urlToLoad)
         }
     }
 }
@@ -788,12 +901,11 @@ class MainWindowController: NSWindowController {
 
 extension MainWindowController: SidebarDelegate {
     func sidebarDidSelectTab(_ tab: Tab) {
-        tabManager.selectTab(tab)
+        selectTab(tab)
     }
 
     func sidebarDidRequestCloseTab(_ tab: Tab) {
-        let interactionState = browserStates[tab.id]?.captureInteractionState()
-        tabManager.closeTab(tab, allTabs: tabs, interactionState: interactionState)
+        closeTab(tab)
     }
 
     func sidebarDidRequestNewTab() {
@@ -805,25 +917,39 @@ extension MainWindowController: SidebarDelegate {
     }
 
     func sidebarDidRequestBack() {
-        browserStates[tabManager.currentTabId ?? UUID()]?.goBack()
+        browserStates[currentTabId ?? UUID()]?.goBack()
     }
 
     func sidebarDidRequestForward() {
-        browserStates[tabManager.currentTabId ?? UUID()]?.goForward()
+        browserStates[currentTabId ?? UUID()]?.goForward()
     }
 
     func sidebarDidRequestReload() {
-        if let state = browserStates[tabManager.currentTabId ?? UUID()] {
+        if let state = browserStates[currentTabId ?? UUID()] {
             if state.isLoading { state.stopLoading() } else { state.reload() }
         }
     }
 
     func sidebarDidSubmitURL(_ url: String) {
         if url.lowercased().hasPrefix("dawn://") {
-            tabManager.openSettings()
+            openSettings()
         } else {
-            browserStates[tabManager.currentTabId ?? UUID()]?.loadURL(url)
+            browserStates[currentTabId ?? UUID()]?.loadURL(url)
         }
+    }
+
+    // A pile dropped outside this window's tab list: commit the move (into the window under the cursor,
+    // or a new torn-off one) and return that window's sidebar to adopt the live pile. nil -> spring home.
+    func sidebarHandOffPile(_ ids: [UUID], at screenPoint: CGPoint) -> SidebarViewController? {
+        windowManager?.handOffPile(ids, from: self, at: screenPoint)
+    }
+
+    func sidebarTabDragMoved(toScreen screenPoint: CGPoint, ids: [UUID]) {
+        windowManager?.tabDragMoved(to: screenPoint, source: self)
+    }
+
+    func sidebarTabDragEnded() {
+        windowManager?.tabDragEnded()
     }
 
     func sidebarDidReorderTabs(_ orderedTabIds: [UUID]) {
