@@ -20,6 +20,9 @@ class BrowserState: NSObject, ObservableObject {
     // Modern Safari User-Agent for website compatibility
     private static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15"
 
+    // Tabs share cookies/storage and web content processes for free: WKWebViewConfiguration defaults
+    // websiteDataStore to the shared .default() store, and since macOS 12 WebKit pools/suspends
+    // processes internally (WKProcessPool is a deprecated no-op). So no shared pool is needed here.
     static func makeConfiguration() -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true

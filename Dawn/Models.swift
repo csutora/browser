@@ -104,7 +104,7 @@ class TabManager: ObservableObject {
         !closedTabsStack.isEmpty
     }
 
-    private func scheduleSave() {
+    func scheduleSave() {
         saveTask?.cancel()
         let task = DispatchWorkItem { [weak self] in try? self?.modelContext?.save() }
         saveTask = task

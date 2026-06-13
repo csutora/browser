@@ -832,7 +832,9 @@ extension MainWindowController: SidebarDelegate {
                 tab.sortIndex = index
             }
         }
-        tabManager.saveNow()
+        // Persist lazily (debounced) rather than a synchronous save here - a blocking disk flush froze
+        // the drop animation. The in-memory order is already applied; quit/idle saves cover durability.
+        tabManager.scheduleSave()
     }
 }
 
