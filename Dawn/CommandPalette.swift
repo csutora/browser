@@ -339,7 +339,12 @@ class CommandPaletteState: ObservableObject {
     // MARK: - DNS Resolution
 
     private func checkDNSResolution(for query: String) {
-        guard !query.contains(".") && !query.contains(" ") && query.count >= 2 else {
+        // Resolve only the host (strip any path and port), so intranet golinks like "go/nix/firefox"
+        // or "go:8080/nix" resolve via their host "go", not the whole string (which CFHost can't look
+        // up). The full query stays the thing we navigate to.
+        let beforePath = query.split(separator: "/", maxSplits: 1).first ?? Substring(query)
+        let host = String(beforePath.split(separator: ":", maxSplits: 1).first ?? beforePath)
+        guard !host.contains("."), !host.contains(" "), host.count >= 2 else {
             return
         }
 
@@ -349,12 +354,12 @@ class CommandPaletteState: ObservableObject {
 
         pendingDNSQuery = query
 
-        DNSResolver.resolveInBackground(query, timeout: 2.0) { [weak self] resolved, hostname in
+        DNSResolver.resolveInBackground(host, timeout: 2.0) { [weak self] resolved, _ in
             guard let self = self else { return }
             guard self.pendingDNSQuery == query, self.inputText == query else { return }
 
-            if resolved, let host = hostname {
-                self.dnsResolvedHost = host
+            if resolved {
+                self.dnsResolvedHost = query
                 self.rebuildSuggestions()
             }
         }
