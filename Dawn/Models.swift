@@ -190,7 +190,7 @@ class TabManager: ObservableObject {
 
         let ordered = orderedTabs(in: window)
         if window.currentTabId == closedId, let index = ordered.firstIndex(where: { $0.id == closedId }) {
-            let newIndex = index > 0 ? index - 1 : (index + 1 < ordered.count ? index + 1 : -1)
+            let newIndex = index + 1 < ordered.count ? index + 1 : index - 1
             window.currentTabId = newIndex >= 0 ? ordered[newIndex].id : nil
         }
         context.delete(tab)
@@ -203,7 +203,10 @@ class TabManager: ObservableObject {
         guard let context = modelContext, var stack = closedTabsByWindow[window.id], let info = stack.popLast() else { return nil }
         closedTabsByWindow[window.id] = stack
 
-        let t = Tab(title: info.title, url: info.url, sortIndex: window.tabs.count, tabType: info.tabType)
+        let ordered = orderedTabs(in: window)
+        let insertAt = min(info.sortIndex, ordered.count)
+        for existing in ordered where existing.sortIndex >= insertAt { existing.sortIndex += 1 }
+        let t = Tab(title: info.title, url: info.url, sortIndex: insertAt, tabType: info.tabType)
         t.backgroundColorHex = info.backgroundColorHex
         t.interactionState = info.interactionState
         context.insert(t)

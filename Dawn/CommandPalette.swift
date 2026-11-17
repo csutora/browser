@@ -84,9 +84,11 @@ class CommandPaletteState: ObservableObject {
 
     private var isTypingForward: Bool = true
 
-    @Published var completionJustAccepted: Bool = false
+    // true once the user arrows through the list: the selection then previews as regular
+    // text in the field, and the ghost completion no longer applies
+    private var isNavigatingSuggestions: Bool = false
 
-    private var showExactMatch: Bool = false
+    @Published var completionJustAccepted: Bool = false
 
     var recentTabs: [Tab] = []
 
@@ -175,7 +177,7 @@ class CommandPaletteState: ObservableObject {
         self.dnsResolvedHost = nil
         self.pendingDNSQuery = nil
         self.completionJustAccepted = false
-        self.showExactMatch = false
+        self.isNavigatingSuggestions = false
 
         switch mode {
         case .newTab:
@@ -213,6 +215,7 @@ class CommandPaletteState: ObservableObject {
     }
 
     func handleTextChange(newDisplayText: String) {
+        isNavigatingSuggestions = false
         if !previewText.isEmpty {
             inputText = previewText
             previewText = ""
@@ -223,13 +226,10 @@ class CommandPaletteState: ObservableObject {
 
         completionJustAccepted = false
 
-        let isAppendToEnd = newDisplayText.hasPrefix(oldInput) && newDisplayText.count > oldInput.count
-
         if newDisplayText == oldInput && !oldCompletion.isEmpty {
             completionText = ""
             isTypingForward = false
             selectedIndex = 0
-            showExactMatch = true
             rebuildSuggestions()
             return
         }
@@ -240,7 +240,6 @@ class CommandPaletteState: ObservableObject {
             previewText = ""
             isTypingForward = false
             selectedIndex = 0
-            showExactMatch = !newDisplayText.isEmpty
 
             if !suggestionsAreRelevant() {
                 googleSuggestions = []
@@ -262,10 +261,6 @@ class CommandPaletteState: ObservableObject {
             previewText = ""
             isTypingForward = true
             selectedIndex = 0
-
-            if isAppendToEnd {
-                showExactMatch = false
-            }
 
             if !suggestionsAreRelevant() {
                 googleSuggestions = []
@@ -295,7 +290,6 @@ class CommandPaletteState: ObservableObject {
             historyResults = []
             isTypingForward = true
             selectedIndex = 0
-            showExactMatch = false
             dnsResolvedHost = nil
             rebuildSuggestions()
         }
@@ -308,20 +302,21 @@ class CommandPaletteState: ObservableObject {
             completionText = ""
             completionJustAccepted = true
             isTypingForward = false
-            showExactMatch = true
+            isNavigatingSuggestions = false
             rebuildSuggestions()
         } else if !completionText.isEmpty {
             inputText = inputText + completionText
             completionText = ""
             completionJustAccepted = true
             isTypingForward = false
-            showExactMatch = true
+            isNavigatingSuggestions = false
             rebuildSuggestions()
         }
     }
 
     func moveSelection(by delta: Int) {
         guard !suggestions.isEmpty else { return }
+        isNavigatingSuggestions = true
         selectedIndex = (selectedIndex + delta + suggestions.count) % suggestions.count
         updateDisplayForSelection()
     }
@@ -331,6 +326,15 @@ class CommandPaletteState: ObservableObject {
             if let suggestion = suggestions.first(where: { $0.displayText == previewText }) {
                 return suggestion.type
             }
+        }
+        if !completionText.isEmpty {
+            // an unaccepted ghost completion is not real text: submit what was typed,
+            // not the suggestion the ghost came from
+            let lower = inputText.lowercased()
+            if let exact = suggestions.first(where: { $0.displayText.lowercased() == lower }) {
+                return exact.type
+            }
+            return classifyInput(inputText) == .url ? .directURL(inputText) : .searchSuggestion(inputText)
         }
         guard selectedIndex < suggestions.count else { return nil }
         return suggestions[selectedIndex].type
@@ -446,14 +450,11 @@ class CommandPaletteState: ObservableObject {
             return lower.hasPrefix(queryLower) && lower != queryLower
         } : []
 
-        let hasAnySuggestions = !continuations.isEmpty || !historyResults.isEmpty
-        if showExactMatch || !hasAnySuggestions {
-            newSuggestions.append(Suggestion(
-                type: .searchSuggestion(query),
-                displayText: query,
-                secondaryText: nil
-            ))
-        }
+        newSuggestions.append(Suggestion(
+            type: .searchSuggestion(query),
+            displayText: query,
+            secondaryText: nil
+        ))
 
         if includeHistorySuggestions && !historyResults.isEmpty {
             var scoredSuggestions: [(Suggestion, Double)] = []
@@ -501,32 +502,28 @@ class CommandPaletteState: ObservableObject {
     }
 
     private func updateDisplayForSelection() {
-        guard !inputText.isEmpty, selectedIndex < suggestions.count else {
-            completionText = ""
-            previewText = ""
-            return
-        }
+        completionText = ""
+        previewText = ""
+        guard !inputText.isEmpty, selectedIndex < suggestions.count else { return }
 
-        let suggestion = suggestions[selectedIndex]
-
-        if case .historyEntry = suggestion.type {
-            completionText = ""
-            previewText = ""
-            return
-        }
-
-        let suggestionLower = suggestion.displayText.lowercased()
         let inputLower = inputText.lowercased()
 
-        if suggestionLower == inputLower {
-            previewText = ""
-            completionText = ""
-        } else if suggestionLower.hasPrefix(inputLower) {
-            previewText = ""
-            completionText = String(suggestion.displayText.dropFirst(inputText.count))
-        } else {
-            completionText = ""
-            previewText = suggestion.displayText
+        if isNavigatingSuggestions {
+            // arrowing through the list shows the suggestion as regular text in the field
+            let suggestion = suggestions[selectedIndex]
+            if case .historyEntry = suggestion.type { return }
+            if suggestion.displayText.lowercased() != inputLower {
+                previewText = suggestion.displayText
+            }
+            return
+        }
+
+        // typing forward: ghost the first actual suggestion below the exact-text row,
+        // when it continues what was typed
+        guard let next = suggestions.first(where: { $0.displayText.lowercased() != inputLower }) else { return }
+        if case .historyEntry = next.type { return }
+        if next.displayText.lowercased().hasPrefix(inputLower) {
+            completionText = String(next.displayText.dropFirst(inputText.count))
         }
     }
 
@@ -565,11 +562,11 @@ class CommandPaletteState: ObservableObject {
         }
     }
 
+    // Suggestions come from the default engine's suggest endpoint. Google (firefox client), DuckDuckGo
+    // (type=list), Bing (osjson) and Ecosia all return the same OpenSearch shape `[query, [sug, ...]]`,
+    // so one parser covers them; engines without a suggest url (or a non-matching one) just yield none.
     private func fetchFromGoogle(query: String) async throws -> [String] {
-        guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://suggestqueries.google.com/complete/search?client=firefox&q=\(encodedQuery)") else {
-            return []
-        }
+        guard let url = SearchEngineStore.shared.suggestURL(for: query) else { return [] }
 
         let (data, _) = try await URLSession.shared.data(from: url)
 

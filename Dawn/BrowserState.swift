@@ -2,6 +2,30 @@ import AppKit
 import WebKit
 import Combine
 
+// webkit takes mouse moves through a rect-based tracking area, so it keeps hovering the page and
+// setting the page's cursor even where native views (the floating sidebar, the command palette)
+// cover it. only let moves through when the page is actually the topmost view under the pointer.
+final class DawnWebView: WKWebView {
+    private var pointerOverPage = false
+
+    override func mouseMoved(with event: NSEvent) {
+        guard let window, let hit = window.contentView?.hitTest(event.locationInWindow) else {
+            super.mouseMoved(with: event)
+            return
+        }
+        guard hit.isDescendant(of: self) else {
+            if pointerOverPage {
+                pointerOverPage = false
+                NSCursor.arrow.set()
+                window.invalidateCursorRects(for: hit)
+            }
+            return
+        }
+        pointerOverPage = true
+        super.mouseMoved(with: event)
+    }
+}
+
 // MARK: - Browser State (wraps WKWebView)
 class BrowserState: NSObject, ObservableObject {
     let webView: WKWebView
@@ -62,8 +86,7 @@ class BrowserState: NSObject, ObservableObject {
     init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
         self.navigationDelegate = NavigationDelegate()
 
-        // Create WKWebView with shared configuration
-        self.webView = WKWebView(frame: .zero, configuration: Self.makeConfiguration())
+        self.webView = DawnWebView(frame: .zero, configuration: Self.makeConfiguration())
 
         self.tabId = tabId
         self.tabManager = tabManager
@@ -194,6 +217,15 @@ class BrowserState: NSObject, ObservableObject {
         guard !hasLoadedInitialContent else { return }
         hasLoadedInitialContent = true
 
+        // File URLs must be loaded with loadFileURL (load(URLRequest:) won't fetch file://, and
+        // restoring interactionState doesn't reliably reload a local file - it comes back blank). So a
+        // restored file tab loads fresh instead, trading its in-page back/forward for actually showing.
+        if let url = pendingURL, url.isFileURL {
+            pendingInteractionState = nil
+            loadFile(url)
+            return
+        }
+
         // Restore interaction state if available (back/forward history)
         if let stateData = pendingInteractionState {
             webView.interactionState = stateData
@@ -212,7 +244,35 @@ class BrowserState: NSObject, ObservableObject {
             urlString = "https://" + urlString
         }
         guard let url = URL(string: urlString) else { return }
-        webView.load(URLRequest(url: url))
+        if url.isFileURL {
+            loadFile(url)
+        } else {
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    // security-scoped grants this tab holds; released when the tab goes away
+    private var accessedFiles: [URL] = []
+
+    private func loadFile(_ url: URL) {
+        var target = url
+        let path = url.standardizedFileURL.path
+        if let held = accessedFiles.first(where: { $0.standardizedFileURL.path == path }) {
+            target = held
+        } else if let granted = FileAccessStore.shared.startAccess(url) {
+            accessedFiles.append(granted)
+            target = granted
+        }
+        // the folder is only readable when the sandbox grants it (e.g. downloads). a file picked on
+        // its own grants just that file, so its sibling assets are out of reach and asking webkit to
+        // extend read access to the folder would exceed what the app holds.
+        let folder = target.deletingLastPathComponent()
+        let scope = FileManager.default.isReadableFile(atPath: folder.path) ? folder : target
+        webView.loadFileURL(target, allowingReadAccessTo: scope)
+    }
+
+    deinit {
+        accessedFiles.forEach { $0.stopAccessingSecurityScopedResource() }
     }
 
     func goBack() {

@@ -712,8 +712,12 @@ class MainWindowController: NSWindowController {
             toggleDock()
 
         case .copyURL:
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(currentTabURL, forType: .string)
+            // One binding for both shapes: a multi-selection copies all as markdown links, else the
+            // current tab's url.
+            if sidebarVC?.copyMultiSelectionAsMarkdown() != true {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(currentTabURL, forType: .string)
+            }
 
         case .openSettings:
             openSettings()
@@ -775,7 +779,21 @@ class MainWindowController: NSWindowController {
             // Apply the chrome state and run the area animation now (deferred so a grow doesn't
             // open up the area before the reflow has finished).
             if currentlyDocked {
-                self.hoverSidebarOpen = true   // just undocked: reveal it now; hover takes over after
+                // just undocked: keep the sidebar open only when the cursor already sits in
+                // its hover hold band; otherwise it animates out with the dock transition
+                // instead of hanging around until the next mouse move closes it
+                var keepOpen = false
+                if let frame = self.window?.frame {
+                    let mouse = NSEvent.mouseLocation
+                    let x = mouse.x - frame.minX
+                    let withinHeight = mouse.y >= frame.minY && mouse.y <= frame.maxY
+                    keepOpen = withinHeight && x >= -150 && x < CGFloat(self.sidebarWidth) + 30
+                }
+                if self.hoverSidebarOpen != keepOpen {
+                    self.hoverSidebarOpen = keepOpen
+                } else if !keepOpen {
+                    self.handleFloatingVisibilityChange()
+                }
             }
             if let bg = self.sidebarContainer.subviews.first as? SidebarFloatingBackground {
                 bg.fullscreenSidebarRadius = self.fullscreenSidebarRadius
@@ -867,8 +885,12 @@ class MainWindowController: NSWindowController {
 
         switch suggestionType {
         case .searchSuggestion(let query):
-            let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-            urlToLoad = "https://www.google.com/search?q=\(encoded)"
+            if let url = SearchEngineStore.shared.searchURL(for: query) {
+                urlToLoad = url.absoluteString
+            } else {
+                let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+                urlToLoad = "https://www.google.com/search?q=\(encoded)"
+            }
         case .directURL(let url):
             urlToLoad = url.contains("://") ? url : "https://\(url)"
         case .dnsResolved(let hostname):

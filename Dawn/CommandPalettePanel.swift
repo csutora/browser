@@ -156,6 +156,9 @@ private class CommandPaletteOverlayView: NSView {
         inputContainer.onTextChange = { [weak self] newText in
             self?.state.handleTextChange(newDisplayText: newText)
         }
+        inputContainer.onAcceptGhost = { [weak self] in
+            self?.state.acceptCompletion()
+        }
         paletteContainer.addSubview(inputContainer)
 
         // Divider
@@ -189,8 +192,9 @@ private class CommandPaletteOverlayView: NSView {
             case 0x30: // Tab - accept completion/preview
                 self.state.acceptCompletion()
                 return nil
-            case 0x7C: // Right Arrow - accept completion if at end
-                if !self.state.completionText.isEmpty || !self.state.previewText.isEmpty {
+            case 0x7C: // Right Arrow - accept completion if caret is at the end
+                if (!self.state.completionText.isEmpty || !self.state.previewText.isEmpty),
+                   self.inputContainer.caretIsAtEnd {
                     self.state.acceptCompletion()
                     return nil
                 }
@@ -309,8 +313,13 @@ private class CommandPaletteOverlayView: NSView {
         for (index, suggestion) in state.suggestions.enumerated() {
             let row = SuggestionRowView(suggestion: suggestion, isSelected: index == state.selectedIndex)
             row.onClick = { [weak self] in
-                self?.state.selectedIndex = index
-                self?.submitCurrent()
+                guard let self else { return }
+                // a click targets the clicked row: drop any arrow-key preview state, which
+                // selectCurrent would otherwise prefer over selectedIndex
+                self.state.previewText = ""
+                self.state.completionText = ""
+                self.state.selectedIndex = index
+                self.submitCurrent()
             }
             suggestionsView.addSubview(row)
             suggestionRows.append(row)

@@ -170,6 +170,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.allowsMultipleSelection = false
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url, let self = self else { return }
+            FileAccessStore.shared.remember(url)
             let controller = self.windowManager.keyController ?? self.windowManager.newWindow()
             controller.createTab(url: url.absoluteString, switchTo: true)
         }

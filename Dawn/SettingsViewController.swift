@@ -110,135 +110,149 @@ class SettingsViewController: NSViewController {
         scrollView.drawsBackground = false
         scrollView.autohidesScrollers = true
         scrollView.autoresizingMask = [.width, .height]
-        // Center the fixed-width content horizontally when the scroll view is wider.
-        scrollView.contentView = CenteringClipView()
-        scrollView.contentView.drawsBackground = false
 
-        let contentView = FlippedView()
-        contentView.wantsLayer = true
-        scrollView.documentView = contentView
+        // Flipped, so the page is top-anchored: a section growing/collapsing only moves content below
+        // it, instead of re-coordinating the whole page (which visually shredded collapse animations).
+        let container = FlippedView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = container
 
-        let maxW: CGFloat = 600
-        let padH: CGFloat = 32
-        let sectionSpacing: CGFloat = 24
-        var y: CGFloat = 120 // .padding(.top, 120)
+        // Vertical stack of fixed-width (600) blocks, centered. Auto-layout so dynamic blocks (the
+        // search-engine disclosure) reflow the whole column when they grow / shrink.
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 24
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
 
-        // Header
+        let clip = scrollView.contentView
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: clip.topAnchor),
+            container.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+            container.widthAnchor.constraint(equalTo: clip.widthAnchor),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 120),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -32),
+            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            stack.widthAnchor.constraint(equalToConstant: 600),
+        ])
+
         let title = NSTextField(labelWithString: "Settings")
         title.font = .systemFont(ofSize: 28, weight: .bold)
         title.textColor = .labelColor
-        title.frame = NSRect(x: padH, y: y, width: maxW, height: 34)
-        contentView.addSubview(title)
-        y += 34 + 8 + sectionSpacing // padding bottom 8 + section spacing
 
-        // General Section
-        y = addSection(title: "General", at: y, in: contentView, padH: padH, maxW: maxW, rows: [
-            ("Homepage", { self.makeLabel("google.com") }),
-            ("Search engine", { self.makeLabel("Google") })
-        ])
-        y += sectionSpacing
+        let searchEngines = SearchEngineSettingsView()
+        searchEngines.onLayoutChange = { [weak scrollView] in scrollView?.documentView?.layoutSubtreeIfNeeded() }
 
-        // Appearance Section
-        y = addSection(title: "Appearance", at: y, in: contentView, padH: padH, maxW: maxW, rows: [
-            ("Fullscreen sidebar radius", { self.makeSliderControl() })
-        ])
-        y += sectionSpacing
-
-        // Search Section
-        y = addSection(title: "Search", at: y, in: contentView, padH: padH, maxW: maxW, rows: [
-            ("Search suggestions", { self.makeToggle(key: "includeSearchSuggestions") }),
-            ("History suggestions", { self.makeToggle(key: "includeHistorySuggestions") })
-        ])
-        y += sectionSpacing
-
-        // Navigation tiles
-        y = addBentoTile(
-            icon: "keyboard", title: "Keyboard Shortcuts",
-            subtitle: "\(KeybindAction.allCases.count) shortcuts configured",
-            at: y, padH: padH, maxW: maxW, in: contentView
-        ) { self.navigationState.navigate(to: "keybinds") }
-        y += sectionSpacing
-
-        y = addBentoTile(
-            icon: "clock.arrow.circlepath", title: "Browsing History",
-            subtitle: "View and manage your history",
-            at: y, padH: padH, maxW: maxW, in: contentView
-        ) { self.navigationState.navigate(to: "history") }
-        y += sectionSpacing
-
-        // Sync Section
-        y = addSection(title: "Sync", at: y, in: contentView, padH: padH, maxW: maxW, rows: [
-            ("iCloud Sync", { self.makeLabel("Not configured") })
-        ])
-        y += 32 // padding bottom
-
-        contentView.frame = NSRect(x: 0, y: 0, width: maxW + padH * 2, height: y)
+        let blocks: [NSView] = [
+            title,
+            makeSectionView(title: "General", rows: [
+                makeSettingRow("Homepage") { self.makeLabel("google.com") },
+                searchEngines,
+            ]),
+            makeSectionView(title: "Appearance", rows: [
+                makeSettingRow("Fullscreen sidebar radius") { self.makeSliderControl() },
+            ]),
+            makeSectionView(title: "Search", rows: [
+                makeSettingRow("Search suggestions") { self.makeToggle(key: "includeSearchSuggestions") },
+                makeSettingRow("History suggestions") { self.makeToggle(key: "includeHistorySuggestions") },
+            ]),
+            makeBentoTileView(icon: "keyboard", title: "Keyboard Shortcuts",
+                              subtitle: "\(KeybindAction.allCases.count) shortcuts configured") { self.navigationState.navigate(to: "keybinds") },
+            makeBentoTileView(icon: "clock.arrow.circlepath", title: "Browsing History",
+                              subtitle: "View and manage your history") { self.navigationState.navigate(to: "history") },
+            makeSectionView(title: "Sync", rows: [
+                makeSettingRow("iCloud Sync") { self.makeLabel("Not configured") },
+            ]),
+        ]
+        for block in blocks {
+            stack.addArrangedSubview(block)
+            block.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        // The big title hugs left rather than stretching its text box visually; constraint is enough.
+        title.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         return scrollView
     }
 
     // MARK: - Section Builder
 
-    /// Builds a SettingsSection: title + VStack(spacing: 1) of rows with background
-    private func addSection(title: String, at y: CGFloat, in container: NSView, padH: CGFloat, maxW: CGFloat, rows: [(String, () -> NSView)]) -> CGFloat {
-        var currentY = y
+    /// A standard section row: title label left, control right, fixed 40pt height.
+    private func makeSettingRow(_ rowTitle: String, _ controlFactory: () -> NSView) -> NSView {
+        let row = NSView()
+        row.wantsLayer = true
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.02).cgColor
+        row.heightAnchor.constraint(equalToConstant: 40).isActive = true
 
-        // Section title: .font(.system(size: 13, weight: .semibold)), .foregroundColor(.secondary), .textCase(.uppercase)
+        let label = NSTextField(labelWithString: rowTitle)
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = .labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(label)
+
+        let control = controlFactory()
+        let size = control.frame.size
+        control.translatesAutoresizingMaskIntoConstraints = false
+        control.widthAnchor.constraint(equalToConstant: size.width).isActive = true
+        control.heightAnchor.constraint(equalToConstant: size.height).isActive = true
+        row.addSubview(control)
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+            label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        return row
+    }
+
+    /// A settings section: uppercase title + a rounded box stacking arbitrary row views.
+    private func makeSectionView(title: String, rows: [NSView]) -> NSView {
+        let container = NSView()
+
         let titleLabel = NSTextField(labelWithString: title.uppercased())
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = .secondaryLabelColor
-        titleLabel.isBezeled = false
-        titleLabel.isEditable = false
-        titleLabel.drawsBackground = false
-        titleLabel.frame = NSRect(x: padH, y: currentY, width: maxW, height: 16)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(titleLabel)
-        currentY += 16 + 12 // spacing: 12 between title and rows
 
-        // Rows container: VStack(spacing: 1), background white 0.05, cornerRadius 8
-        let rowsContainer = NSView()
-        rowsContainer.wantsLayer = true
-        rowsContainer.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
-        rowsContainer.layer?.cornerRadius = 8
-        rowsContainer.layer?.cornerCurve = .continuous
-        rowsContainer.layer?.masksToBounds = true
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
+        box.layer?.cornerRadius = 8
+        box.layer?.cornerCurve = .continuous
+        box.layer?.masksToBounds = true
+        box.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(box)
 
-        let rowH: CGFloat = 40 // padding vertical 10 + content ~20
-        let totalRowsH = CGFloat(rows.count) * rowH + CGFloat(max(0, rows.count - 1)) // +1px divider between rows
+        let rowsStack = NSStackView()
+        rowsStack.orientation = .vertical
+        rowsStack.spacing = 1
+        rowsStack.alignment = .width
+        rowsStack.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(rowsStack)
+        NSLayoutConstraint.activate([
+            rowsStack.topAnchor.constraint(equalTo: box.topAnchor),
+            rowsStack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+            rowsStack.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            rowsStack.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+        ])
 
-        rowsContainer.frame = NSRect(x: padH, y: currentY, width: maxW, height: totalRowsH)
-        container.addSubview(rowsContainer)
-
-        var rowY: CGFloat = 0
-        for (index, (rowTitle, controlFactory)) in rows.enumerated() {
-            // Row: HStack { title, Spacer, control }, padding h:12 v:10, bg white 0.02
-            let row = NSView(frame: NSRect(x: 0, y: rowY, width: maxW, height: rowH))
-            row.wantsLayer = true
-            row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.02).cgColor
-            rowsContainer.addSubview(row)
-
-            let label = NSTextField(labelWithString: rowTitle)
-            label.font = .systemFont(ofSize: 13)
-            label.textColor = .labelColor
-            label.isBezeled = false
-            label.isEditable = false
-            label.drawsBackground = false
-            label.frame = NSRect(x: 12, y: (rowH - 18) / 2, width: maxW * 0.5, height: 18)
-            row.addSubview(label)
-
-            let control = controlFactory()
-            // Position control on right side
-            let controlW = control.frame.width
-            let controlH = control.frame.height
-            control.frame = NSRect(x: maxW - 12 - controlW, y: (rowH - controlH) / 2, width: controlW, height: controlH)
-            row.addSubview(control)
-
-            rowY += rowH
-            if index < rows.count - 1 {
-                rowY += 1 // VStack spacing: 1
-            }
+        for row in rows {
+            rowsStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         }
 
-        return currentY + totalRowsH
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: container.topAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            box.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            box.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            box.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            box.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        return container
     }
 
     // MARK: - Control Factories
@@ -309,9 +323,12 @@ class SettingsViewController: NSViewController {
 
     // MARK: - Bento Tile
 
-    private func addBentoTile(icon: String, title: String, subtitle: String, at y: CGFloat, padH: CGFloat, maxW: CGFloat, in container: NSView, action: @escaping () -> Void) -> CGFloat {
+    private func makeBentoTileView(icon: String, title: String, subtitle: String, action: @escaping () -> Void) -> NSView {
         let tileH: CGFloat = 84
-        let tile = ClickableView(frame: NSRect(x: padH, y: y, width: maxW, height: tileH))
+        let maxW: CGFloat = 600
+        let tile = ClickableView(frame: NSRect(x: 0, y: 0, width: maxW, height: tileH))
+        tile.translatesAutoresizingMaskIntoConstraints = false
+        tile.heightAnchor.constraint(equalToConstant: tileH).isActive = true
         tile.wantsLayer = true
         tile.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
         tile.layer?.cornerRadius = 12
@@ -319,7 +336,6 @@ class SettingsViewController: NSViewController {
         tile.layer?.borderWidth = 1
         tile.layer?.borderColor = NSColor.white.withAlphaComponent(0.1).cgColor
         tile.onClick = action
-        container.addSubview(tile)
 
         // Icon: 24pt in 44x44 frame with white 0.1 bg, cornerRadius 10
         let iconView = NSImageView(frame: NSRect(x: 20, y: (tileH - 44) / 2, width: 44, height: 44))
@@ -358,7 +374,7 @@ class SettingsViewController: NSViewController {
         chevron.contentTintColor = .secondaryLabelColor
         tile.addSubview(chevron)
 
-        return y + tileH
+        return tile
     }
 }
 
@@ -370,6 +386,8 @@ class FlippedView: NSView {
 // MARK: - Clickable View
 class ClickableView: NSView {
     var onClick: (() -> Void)?
+    var restColor = NSColor.white.withAlphaComponent(0.05)
+    var hoverColor = NSColor.white.withAlphaComponent(0.08)
     private var trackingArea: NSTrackingArea?
 
     override func mouseUp(with event: NSEvent) {
@@ -390,11 +408,11 @@ class ClickableView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        layer?.backgroundColor = hoverColor.cgColor
     }
 
     override func mouseExited(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
+        layer?.backgroundColor = restColor.cgColor
     }
 }
 

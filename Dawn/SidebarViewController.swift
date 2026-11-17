@@ -39,7 +39,7 @@ class SidebarViewController: NSViewController {
     private var forwardButton: NSButton!
     private var reloadButton: NSButton!
     private var urlContainer: NSView!
-    private var searchIcon: NSImageView!
+    private var urlFadeWrap: NSView!
     private var urlBar: NSTextField!
     private var dividerView: NSView!
     private var scrollView: NSScrollView!
@@ -164,14 +164,10 @@ class SidebarViewController: NSViewController {
         urlContainer.layer?.borderColor = NSColor.white.withAlphaComponent(0.05).cgColor
         container.addSubview(urlContainer)
 
-        searchIcon = NSImageView()
-        searchIcon.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
-        searchIcon.contentTintColor = .secondaryLabelColor
-        urlContainer.addSubview(searchIcon)
-
         urlBar = NSTextField()
-        let urlCell = VerticallyCenteredTextFieldCell()
+        let urlCell = URLBarCell()
+        urlCell.onBeginEditing = { [weak self] editor in self?.urlEditingBegan(editor) }
+        urlCell.onEndEditing = { [weak self] in self?.urlEditingEnded() }
         urlCell.isEditable = true
         urlCell.isSelectable = true
         urlCell.wraps = false
@@ -184,7 +180,13 @@ class SidebarViewController: NSViewController {
         urlBar.textColor = .white
         urlBar.placeholderString = "Search"
         urlBar.delegate = self
-        urlContainer.addSubview(urlBar)
+        urlBar.usesSingleLineMode = true
+        // The right-edge fade masks this wrapper (masking the field itself disturbs its editor).
+        urlFadeWrap = NSView()
+        urlFadeWrap.wantsLayer = true
+        urlContainer.addSubview(urlFadeWrap)
+        urlBar.autoresizingMask = [.width, .height]
+        urlFadeWrap.addSubview(urlBar)
 
         // Divider
         dividerView = NSView()
@@ -204,6 +206,15 @@ class SidebarViewController: NSViewController {
         tabListView = TabListDropView()
         tabListView.wantsLayer = true
         scrollView.documentView = tabListView
+
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            for cell in self.tabCellViews.values { cell.refreshHover() }
+        }
 
         // Footer
         footerView = SidebarBackgroundView()
@@ -254,19 +265,23 @@ class SidebarViewController: NSViewController {
             self?.clearMultiSelection()
         }
 
-        // Local keys for the tab selection: esc clears a multi-selection; cmd-C copies the selected
-        // tabs as markdown links (one per line, list order), unless a text field is being edited.
-        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self else { return event }
-            if event.keyCode == 53, self.selectedTabIds.count > 1 {
-                self.clearMultiSelection()
-                return nil
+        // Tab-selection housekeeping: esc clears a multi-selection, and so does any click that isn't on
+        // a tab cell (web content, sidebar chrome, another window) - observed passively, nothing is
+        // consumed or injected. Copying goes through the copy-url keybind, so plain cmd-C stays with
+        // the page (sites like figma bind it themselves).
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
+            guard let self = self, self.selectedTabIds.count > 1 else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53 { self.clearMultiSelection(); return nil }
+                return event
             }
-            if event.modifierFlags.contains(.command),
-               event.charactersIgnoringModifiers?.lowercased() == "c",
-               !self.selectedTabIds.isEmpty, !self.isEditingText {
-                self.copySelectedTabsAsMarkdown()
-                return nil
+            if event.window !== self.view.window {
+                self.clearMultiSelection()   // clicked another window entirely
+            } else {
+                let p = self.tabListView.convert(event.locationInWindow, from: nil)
+                if !self.tabCellViews.values.contains(where: { $0.frame.contains(p) }) {
+                    self.clearMultiSelection()
+                }
             }
             return event
         }
@@ -279,6 +294,68 @@ class SidebarViewController: NSViewController {
         if let obs = unfocusObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = focusURLBarObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = escMonitor { NSEvent.removeMonitor(obs) }
+    }
+
+
+
+
+
+    // Wired to the cell's begin/end-editing hooks (see VerticallyCenteredTextFieldCell).
+    private func urlEditingBegan(_ editor: NSText) {
+        // Brighten IN PLACE on the field editor's storage (attribute-only, nothing moves, the click's
+        // caret position survives), then APPEND the tail the display cut off - appending doesn't move
+        // the glyphs already on screen, so the editor gains the full url without any jump.
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.white,
+        ]
+        if let tv = editor as? NSTextView, let storage = tv.textStorage {
+            storage.addAttributes(attrs, range: NSRange(location: 0, length: storage.length))
+            tv.typingAttributes = attrs
+            let shown = storage.string
+            if !currentURLString.isEmpty, currentURLString.hasPrefix(shown), currentURLString != shown {
+                let tail = String(currentURLString.dropFirst(shown.count))
+                storage.append(NSAttributedString(string: tail, attributes: attrs))
+            }
+        }
+        updateURLFade()
+    }
+
+
+    private func urlEditingEnded() {
+        currentURLString = urlBar.stringValue
+        refreshURLDisplay()
+    }
+
+    // Same right-edge fade as the tab titles, masking the wrap: on while the (cut) display shows, off
+    // while editing so the editor can scroll freely.
+    private let urlFadeMask: CAGradientLayer = {
+        let m = CAGradientLayer()
+        m.startPoint = CGPoint(x: 0, y: 0.5)
+        m.endPoint = CGPoint(x: 1, y: 0.5)
+        m.colors = [NSColor.white.cgColor, NSColor.white.cgColor, NSColor.clear.cgColor]
+        return m
+    }()
+
+    private func updateURLFade() {
+        let w = urlFadeWrap.bounds.width
+        guard w > 0 else { return }
+        if urlFadeWrap.layer?.mask !== urlFadeMask { urlFadeWrap.layer?.mask = urlFadeMask }
+        let fadeWidth: CGFloat = 24
+        let editing = urlBar.currentEditor() != nil
+        let cut = urlBar.stringValue != currentURLString
+        let needsFade = !editing && cut
+        // Hug the fade to where the (cut) text actually ends, so the tail fades out right at the cut
+        // instead of dimming a band before it.
+        let textEnd = min(w, urlBar.attributedStringValue.size().width + 2)
+        let fadeStart = max(0, textEnd - fadeWidth)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        urlFadeMask.frame = urlFadeWrap.bounds
+        urlFadeMask.locations = needsFade
+            ? [0, NSNumber(value: Double(fadeStart / w)), NSNumber(value: Double(textEnd / w))]
+            : [0, 1, 1]
+        CATransaction.commit()
     }
 
     func focusURLBar() {
@@ -340,19 +417,18 @@ class SidebarViewController: NSViewController {
         let urlBarY = bounds.height - headerH - urlBarH
         urlContainer.frame = NSRect(x: 12, y: urlBarY, width: w - 24, height: urlBarH)
 
-        // Search icon: 16x16 with equal padding
-        searchIcon.frame = NSRect(x: urlBarInnerPad, y: (urlBarH - 16) / 2, width: 16, height: 16)
-
-        // Text field: icon (16) + spacing (8) from icon. Full container height with a
-        // vertically-centering cell so the text sits on the same line as the icon.
-        let textFieldX = urlBarInnerPad + 16 + 8
-        let urlFieldH: CGFloat = 24
-        urlBar.frame = NSRect(
-            x: textFieldX,
-            y: (urlBarH - urlFieldH) / 2,
-            width: urlContainer.frame.width - textFieldX - urlBarInnerPad,
+        // Text field spans the bar, equal padding both sides (no icon - the bar mostly displays the
+        // url). It is sized to its NATURAL text height and vertically centered by frame placement, so
+        // no cell geometry tricks are needed and display/editing agree natively.
+        let urlFieldH = ceil(urlBar.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: 10000, height: 100)).height ?? 17)
+        urlFadeWrap.frame = NSRect(
+            x: urlBarInnerPad,
+            y: ((urlBarH - urlFieldH) / 2).rounded(),
+            width: urlContainer.frame.width - urlBarInnerPad * 2,
             height: urlFieldH
         )
+        urlBar.frame = urlFadeWrap.bounds
+        refreshURLDisplay()   // the display cut depends on the width
 
         // Divider: centered between URL bar bottom and tab list top
         let dividerY = urlBarY - 14
@@ -496,9 +572,63 @@ class SidebarViewController: NSViewController {
         }
     }
 
+    private var currentURLString = ""
+
     func updateURLBar(_ url: String) {
-        urlBar.stringValue = url
+        currentURLString = url
+        refreshURLDisplay()
     }
+
+    // The displayed string is CUT to what fits the bar (hard cut, hidden under the fade): text that
+    // always fits renders head-anchored deterministically, which is what keeps click-in from jumping.
+    // The editor gets the full url appended back at focus (see urlEditingBegan).
+    private func refreshURLDisplay() {
+        guard urlBar.currentEditor() == nil else { return }   // don't stomp active typing
+        let width = urlBar.bounds.width
+        let styled = styledURL(currentURLString)
+        guard width > 0, styled.size().width > width else {
+            urlBar.attributedStringValue = styled
+            updateURLFade()
+            return
+        }
+        var lo = 0, hi = styled.length
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if styled.attributedSubstring(from: NSRange(location: 0, length: mid)).size().width <= width {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        urlBar.attributedStringValue = styled.attributedSubstring(from: NSRange(location: 0, length: lo))
+        updateURLFade()
+    }
+
+    // Display styling: the core domain (last two host labels) pops in full white, everything else -
+    // scheme, subdomains, path - fades back but stays readable.
+    private func styledURL(_ s: String) -> NSAttributedString {
+        let faded = NSColor.white.withAlphaComponent(0.45)
+        let attributed = NSMutableAttributedString(string: s, attributes: [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: faded,
+        ])
+        // Host = between the scheme separator (if any) and the first /, ?, #, or : (port).
+        let ns = s as NSString
+        let afterScheme = ns.range(of: "://").location
+        let hostStart = afterScheme == NSNotFound ? 0 : afterScheme + 3
+        var hostEnd = ns.length
+        for (i, ch) in s.unicodeScalars.enumerated() where i >= hostStart {
+            if ch == "/" || ch == "?" || ch == "#" || ch == ":" { hostEnd = i; break }
+        }
+        guard hostEnd > hostStart else { return attributed }
+        let host = ns.substring(with: NSRange(location: hostStart, length: hostEnd - hostStart))
+        let labels = host.split(separator: ".")
+        let core = labels.count >= 2 ? labels.suffix(2).joined(separator: ".") : host
+        let coreRange = NSRange(location: hostEnd - (core as NSString).length, length: (core as NSString).length)
+        attributed.addAttribute(.foregroundColor, value: NSColor.white, range: coreRange)
+        return attributed
+    }
+
 
     func updateNavState(for browserState: BrowserState?) {
         let canBack = browserState?.canGoBack ?? false
@@ -1003,18 +1133,17 @@ class SidebarViewController: NSViewController {
         updateSelectionHighlights()
     }
 
-    // True while the URL bar (its field editor) has focus, so cmd-C there copies text, not tabs.
-    private var isEditingText: Bool { view.window?.firstResponder is NSText }
-
-    // Copy the selected tabs as markdown links, one per line in list order - the export path now that
-    // dragging is reserved for in-app moves (reorder, and later tear-off / split).
-    private func copySelectedTabsAsMarkdown() {
+    // The copy-url keybind's multi-tab half: with a multi-selection, copy it as markdown links (one
+    // per line, list order) and return true; otherwise false so the caller copies the current url.
+    func copyMultiSelectionAsMarkdown() -> Bool {
+        guard selectedTabIds.count > 1 else { return false }
         let md = tabs.filter { selectedTabIds.contains($0.id) }
             .map { "[\($0.title.isEmpty ? "Untitled" : $0.title)](\($0.url))" }
             .joined(separator: "\n")
-        guard !md.isEmpty else { return }
+        guard !md.isEmpty else { return false }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(md, forType: .string)
+        return true
     }
 
     // MARK: - Tab List
@@ -1097,7 +1226,14 @@ class TabListDropView: FlippedView {
 
 // MARK: - Sidebar Background View
 
+
 class SidebarBackgroundView: NSView {
+    var onMovedToWindow: (() -> Void)?
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { onMovedToWindow?() }
+    }
+
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
@@ -1118,23 +1254,85 @@ class SidebarBackgroundView: NSView {
 
 // MARK: - Vertically Centered Text Field Cell
 
+// Canonical vertically-centering cell (Jalkut's RSVerticallyCenteredTextFieldCell pattern): center in
+// drawingRect(forBounds:), the single geometry source AppKit consults for both display drawing and
+// field-editor setup, with the flag disabling the adjustment while editing.
 class VerticallyCenteredTextFieldCell: NSTextFieldCell {
-    private func centered(_ rect: NSRect) -> NSRect {
-        let textHeight = cellSize(forBounds: rect).height
-        guard textHeight < rect.height else { return rect }
-        let y = rect.origin.y + (rect.height - textHeight) / 2
-        return NSRect(x: rect.origin.x, y: y, width: rect.width, height: textHeight)
-    }
+    private var isEditingOrSelecting = false
 
-    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
-        super.drawInterior(withFrame: centered(cellFrame), in: controlView)
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        var newRect = super.drawingRect(forBounds: rect)
+        if !isEditingOrSelecting {
+            let textSize = cellSize(forBounds: rect)
+            let heightDelta = newRect.size.height - textSize.height
+            if heightDelta > 0 {
+                newRect.size.height -= heightDelta
+                newRect.origin.y += heightDelta / 2
+            }
+        }
+        return newRect
     }
 
     override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: centered(rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+        let centered = drawingRect(forBounds: rect)
+        isEditingOrSelecting = true
+        super.edit(withFrame: centered, in: controlView, editor: textObj, delegate: delegate, event: event)
+        isEditingOrSelecting = false
     }
 
     override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
-        super.select(withFrame: centered(rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+        let centered = drawingRect(forBounds: rect)
+        isEditingOrSelecting = true
+        super.select(withFrame: centered, in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+        isEditingOrSelecting = false
     }
 }
+
+class URLBarCell: NSTextFieldCell {
+    var onBeginEditing: ((NSText) -> Void)?
+    var onEndEditing: (() -> Void)?
+
+    // a field editor reused across edits keeps geometry from its previous session: when that session
+    // overflowed the field, the next attach clamps the editing clip view's -2.5pt outset to 0, so the
+    // text shifts left by that much and clicks hit-test against the shifted layout. the window's shared
+    // editor is reused by every field in the window, which made the jump look random. a fresh editor
+    // per editing session always attaches with the same geometry the resting display uses.
+    private var sessionEditor: NSTextView?
+
+    override func fieldEditor(for controlView: NSView) -> NSTextView? {
+        if let editor = sessionEditor { return editor }
+        let editor = NSTextView()
+        editor.isFieldEditor = true
+        sessionEditor = editor
+        return editor
+    }
+
+    // AppKit links display anchoring and editor scrolling to ONE flag: isScrollable=false gives a
+    // deterministic head-anchored resting display but a non-scrolling editor; =true scrolls but makes
+    // the resting display content-dependent. So flip it at the editing boundary: scrollable only
+    // while the field editor is attached.
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
+        isScrollable = true
+        super.edit(withFrame: rect, in: controlView, editor: textObj, delegate: delegate, event: event)
+        onBeginEditing?(textObj)
+    }
+
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
+        // Focus-by-click: skip the automatic select-all (its scroll-to-end would move overflowing
+        // text before the click places the caret). Keyboard focus (cmd+L) keeps the select-all.
+        var start = selStart, length = selLength
+        if NSApp.currentEvent?.type == .leftMouseDown { start = 0; length = 0 }
+        isScrollable = true
+        super.select(withFrame: rect, in: controlView, editor: textObj, delegate: delegate, start: start, length: length)
+        onBeginEditing?(textObj)
+    }
+
+    override func endEditing(_ textObj: NSText) {
+        super.endEditing(textObj)
+        sessionEditor = nil
+        isScrollable = false   // back to the deterministic resting display
+        onEndEditing?()
+    }
+}
+
+

@@ -200,6 +200,20 @@ class TabCellView: NSView {
         updateAppearance()
     }
 
+    // tracking areas only fire on mouse movement, so content scrolling under a
+    // stationary cursor leaves stale hover states. re-check from the real pointer.
+    func refreshHover() {
+        var inside = false
+        if let window, window.isKeyWindow {
+            let p = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            inside = visibleRect.contains(p)
+        }
+        if inside != isHovered {
+            isHovered = inside
+            updateAppearance()
+        }
+    }
+
     override func mouseExited(with event: NSEvent) {
         isHovered = false
         updateAppearance()
