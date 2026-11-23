@@ -226,11 +226,11 @@ final class IconStore {
 // or credentials, and hands over the bytes. this is the private hook safari uses; without it, pages
 // simply show no icon.
 final class IconLoadingBridge: NSObject {
-    // asked for each of the page's favicons (not the larger touch icons, made for home screens); returns
-    // what receives its bytes, or nil when they're unwanted
-    private let offered: () -> ((Data?) -> Void)?
+    // asked for each of the page's icons: its favicons, and its touch icons (the larger ones made for
+    // home screens) when `touch` is set; returns what receives its bytes, or nil when they're unwanted
+    private let offered: (_ touch: Bool) -> ((Data?) -> Void)?
 
-    init(offered: @escaping () -> ((Data?) -> Void)?) {
+    init(offered: @escaping (_ touch: Bool) -> ((Data?) -> Void)?) {
         self.offered = offered
     }
 
@@ -244,8 +244,11 @@ final class IconLoadingBridge: NSObject {
     @objc(webView:shouldLoadIconWithParameters:completionHandler:)
     func webView(_ webView: WKWebView, shouldLoadIconWithParameters parameters: NSObject,
                  completionHandler: @escaping (((Data?) -> Void)?) -> Void) {
-        let faviconType = 0
-        guard (parameters.value(forKey: "iconType") as? Int) == faviconType, let receive = offered() else { return completionHandler(nil) }
+        // WKLinkIconType: favicon, touch icon, precomposed touch icon
+        let faviconType = 0, touchIconTypes = [1, 2]
+        let type = parameters.value(forKey: "iconType") as? Int
+        guard type == faviconType || touchIconTypes.contains(type ?? -1),
+              let receive = offered(type != faviconType) else { return completionHandler(nil) }
         completionHandler(receive)
     }
 }

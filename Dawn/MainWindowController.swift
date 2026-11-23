@@ -15,18 +15,31 @@ class MainWindowController: NSWindowController {
 
     // The current tab's live URL (web view if any, else the stored url) - for the URL bar / copy.
     var currentTabURL: String {
-        if let id = currentTabId, let live = browserStates[id]?.currentURL?.absoluteString { return live }
+        if let live = currentBrowserState?.currentURL?.absoluteString { return live }
         return currentTab?.url ?? ""
     }
 
-    var currentBrowserState: BrowserState? {
-        currentTabId.flatMap { browserStates[$0] }
+    var favorites: FavoritesController? { windowManager?.favorites }
+    var webContent: WebContentViewController { webContentVC }
+
+    // a tab of this window or a favorite
+    func tab(for id: UUID?) -> Tab? {
+        guard let id else { return nil }
+        return tabs.first(where: { $0.id == id }) ?? favoriteTabs.first(where: { $0.id == id })
     }
 
-    var currentTab: Tab? {
-        guard let id = currentTabId else { return nil }
-        return tabs.first(where: { $0.id == id })
+    // the live page of a tab of this window, or of a favorite
+    func state(for id: UUID?) -> BrowserState? {
+        guard let id else { return nil }
+        return browserStates[id] ?? favorites?.state(for: id)
     }
+
+    var currentBrowserState: BrowserState? { state(for: currentTabId) }
+    var currentTab: Tab? { tab(for: currentTabId) }
+
+    // the tab shown before the current one: switching back to it is instant, so it's never unloaded
+    private(set) var previousTabId: UUID?
+    private var shownTabId: UUID?
 
     // Set by the WindowManager: called when this window closes (user close or app quit).
     var onWindowClose: (() -> Void)?
@@ -43,12 +56,12 @@ class MainWindowController: NSWindowController {
 
     // A pile from another window is hovering this one: open a make-space gap (the sidebar reveal is
     // handled by the shared hover monitor, since the drag emits mouse-dragged events).
-    func beginForeignTabDrag() {
-        sidebarVC?.beginForeignDrag()
+    func beginForeignTabDrag(pileSize: Int, excluding: Set<UUID>) {
+        sidebarVC?.beginForeignDrag(pileSize: pileSize, excluding: excluding)
     }
 
     func updateForeignTabGap(atScreen screenPoint: CGPoint) {
-        sidebarVC?.updateForeignGap(sidebarVC?.tabListInsertionIndex(atScreen: screenPoint))
+        sidebarVC?.updateForeignGap(atScreen: screenPoint)
     }
 
     func endForeignTabDrag() {
@@ -61,21 +74,28 @@ class MainWindowController: NSWindowController {
 
     var sidebar: SidebarViewController? { sidebarVC }
 
-    // Capture each tab's web-view interaction state into its model, so a later restore (reopen of a
-    // kept last window, or relaunch) brings the page back with its history/scroll, not a bare reload.
-    func persistInteractionState() {
+    // Reads every live page of this window into its tab, so a later restore (reopen of a kept last
+    // window, or relaunch) brings each page back as it was. The pages have to have stopped showing first
+    // (the window closed or ordered out) for their form fields to be included.
+    func captureLiveTabs(_ completion: @escaping () -> Void) {
+        let group = DispatchGroup()
         for (id, state) in browserStates {
-            guard let data = state.captureInteractionState(),
-                  let tab = tabs.first(where: { $0.id == id }) else { continue }
-            tab.interactionState = data
+            group.enter()
+            state.captureState { [tabManager] page in
+                tabManager.savePage(id, page)
+                group.leave()
+            }
         }
+        group.notify(queue: .main, execute: completion)
     }
 
     let keybindHandler = KeybindHandler.shared
     let commandPaletteState = CommandPaletteState()
 
+    // the live pages of this window's tabs; an unloaded tab (or one not shown since launch) has none
     var browserStates: [UUID: BrowserState] = [:]
     var tabs: [Tab] = []
+    private(set) var favoriteTabs: [Tab] = []
 
     // Layout views
     private var rootView: NSView!
@@ -192,6 +212,7 @@ class MainWindowController: NSWindowController {
         }
 
         sidebarVC.reloadTabs(tabs)
+        sidebarVC.reloadFavorites(favoriteTabs, animated: false)
         sidebarVC.updateSelection()
         updateWindowTitle()
         // Web view creation (syncStates/handleTabSwitch) is deferred to showWindow(), so it
@@ -401,10 +422,25 @@ class MainWindowController: NSWindowController {
         DownloadManager.shared.events
             .sink { [weak self] event in
                 guard case .started(_, let source) = event, let self, let source,
-                      self.browserStates.values.contains(where: { $0.webView === source }) else { return }
+                      self.browserStates.values.contains(where: { $0.webView === source })
+                        || self.currentBrowserState?.webView === source else { return }
                 self.launchDownloadFlight()
             }
             .store(in: &cancellables)
+
+        // favorites are shared: any window pinning, unpinning, reordering, closing or opening one
+        // changes every window's tiles
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(favoritesDidChange),
+            name: .favoritesDidChange, object: nil
+        )
+
+        // a favorite's page is shown in the window using it, so a window coming to the front takes
+        // back the favorite it shows
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowDidBecomeKey),
+            name: NSWindow.didBecomeKeyNotification, object: window
+        )
 
         // Per-tab data updates (title/url/bg) can come from any window's web view; only react to tabs
         // this window owns. Structural changes (create/close/reorder) are driven directly, no notif.
@@ -444,25 +480,108 @@ class MainWindowController: NSWindowController {
         loadTabs()
         syncStates()
         sidebarVC.reloadTabs(tabs)
+        sidebarVC.reloadFavorites(favoriteTabs, animated: true)
         updateWindowTitle()
     }
 
     @objc private func tabDataDidChange(_ notification: Notification) {
-        guard let tabId = notification.object as? UUID, tabs.contains(where: { $0.id == tabId }) else { return }
+        guard let tabId = notification.object as? UUID, tab(for: tabId) != nil else { return }
         sidebarVC.updateTab(tabId)
         updateWindowTitle()
     }
 
+    @objc private func favoritesDidChange() {
+        let wasCurrent = currentTab
+        refreshTabs()
+        // the current favorite went to another window (unpinned there): this window moves on
+        if wasCurrent != nil, currentTab == nil {
+            windowModel.currentTabId = fallbackTabId(excluding: wasCurrent?.id)
+            handleTabSwitch()
+        } else {
+            sidebarVC.updateSelection()
+        }
+    }
+
+    @objc private func windowDidBecomeKey() {
+        guard let id = currentTabId, currentTab?.isFavorite == true, favorites?.host(of: id) !== self else { return }
+        handleTabSwitch()
+    }
+
+    // what to show when the current tab goes: the one shown before it, else the first tab
+    func fallbackTabId(excluding id: UUID?) -> UUID? {
+        if let previous = previousTabId, previous != id, tab(for: previous) != nil, tab(for: previous)?.favoriteClosed != true { return previous }
+        return tabs.first(where: { $0.id != id })?.id
+    }
+
     func handleTabSwitch() {
-        webContentVC.switchToTab(
-            currentTabId,
-            browserStates: browserStates,
-            tabs: tabs
-        )
+        let id = currentTabId
+        if id != shownTabId {
+            if let shown = shownTabId, tab(for: shown) != nil { previousTabId = shown }
+            shownTabId = id
+        }
+        let tab = currentTab
+        if let tab { ensureLive(tab) }
+        let settingsPath = tab?.isSettings == true ? extractSettingsPath(from: tab?.url ?? "") : nil
+        let show = { [weak self] in
+            guard let self, self.currentTabId == id else { return }
+            self.webContentVC.show(id, state: self.state(for: id), settingsPath: settingsPath)
+        }
+        if let tab, tab.isFavorite, let favorites {
+            favorites.claim(tab.id, for: self, then: show)
+        } else {
+            show()
+        }
         sidebarVC.updateSelection()
-        sidebarVC.updateNavState(for: browserStates[currentTabId ?? UUID()])
+        sidebarVC.updateNavState(for: currentBrowserState)
         observeCurrentBrowserState()
         updateWindowTitle()
+    }
+
+    // the tab's page, made live if it isn't
+    @discardableResult
+    private func ensureLive(_ tab: Tab) -> BrowserState? {
+        guard !tab.isSettings else { return nil }
+        if tab.isFavorite { return favorites?.ensureLive(tab) }
+        if let state = browserStates[tab.id] { return state }
+        let state = BrowserState(
+            tabId: tab.id,
+            tabManager: tabManager,
+            historyManager: historyManager,
+            initialURL: URL(string: tab.url),
+            saved: tab.savedPage,
+            iconKey: tab.iconKey
+        )
+        adopt(state)
+        return state
+    }
+
+    // a live page joining this window (made here, unpinned into it, or moved from another window)
+    func adopt(_ state: BrowserState) {
+        state.onNewTabRequested = { [weak self] url, switchToTab in
+            self?.createTab(url: url.absoluteString, switchTo: switchToTab)
+        }
+        state.onNewWindowRequested = { [weak self] url in
+            self?.windowManager?.newWindow(url: url.absoluteString)
+        }
+        browserStates[state.tabId] = state
+    }
+
+    // the tab's page goes, kept with the tab to come back as it was when the tab is shown again.
+    // reports whether it went (the tab may have been shown meanwhile), and the process that showed it,
+    // which exits once nothing else uses it.
+    func unload(_ id: UUID, completion: @escaping (Bool, pid_t?) -> Void) {
+        guard id != currentTabId, id != previousTabId, let state = browserStates[id] else { return completion(false, nil) }
+        let pid = state.webProcessIdentifier
+        state.captureState { [weak self] page in
+            guard let self, id != self.currentTabId, id != self.previousTabId, self.browserStates[id] === state else {
+                return completion(false, nil)
+            }
+            self.tabManager.savePage(id, page)
+            self.browserStates.removeValue(forKey: id)
+            self.syncStates()
+            self.sidebar?.updateTab(id)
+            completion(true, pid)
+        }
     }
 
     private func observeCurrentBrowserState() {
@@ -473,7 +592,7 @@ class MainWindowController: NSWindowController {
         sidebarVC.updateURLBar(currentTabURL)
         sidebarVC.setWindowHasTab(currentTab != nil)
 
-        guard let currentId = currentTabId, let state = browserStates[currentId] else { return }
+        guard let state = currentBrowserState else { return }
 
         state.$currentURL
             .receive(on: DispatchQueue.main)
@@ -501,23 +620,40 @@ class MainWindowController: NSWindowController {
     }
 
     @discardableResult
-    func createTab(url: String = "https://www.google.com", switchTo: Bool = true) -> Tab {
-        let t = tabManager.createTab(in: windowModel, url: url, switchTo: switchTo)
+    func createTab(url: String = "https://www.google.com", switchTo: Bool = true, at index: Int? = nil) -> Tab {
+        let t = tabManager.createTab(in: windowModel, url: url, switchTo: switchTo, at: index)
         refreshTabs()
         if switchTo { handleTabSwitch() }
         return t
     }
 
     func closeTab(_ tab: Tab) {
-        let interactionState = browserStates[tab.id]?.captureInteractionState()
-        tabManager.closeTab(tab, in: windowModel, interactionState: interactionState)
-        if windowModel.tabs.isEmpty {
+        if tab.isFavorite {
+            windowManager?.closeFavorite(tab)
+            return
+        }
+        let id = tab.id
+        let state = browserStates[id]
+        tabManager.closeTab(tab, in: windowModel)
+        // the page is read for reopening once it has stopped showing, which it does below
+        state?.captureState { [tabManager] page in tabManager.closedTabStateCaptured(id, page) }
+        if windowModel.tabs.isEmpty, currentTab == nil {
             // Last tab closed: close the window (deferred so this call can unwind before the window
             // - and this controller - go away). The app stays alive even with no windows.
             DispatchQueue.main.async { [weak self] in self?.window?.close() }
             return
         }
+        if windowModel.currentTabId == nil || windowModel.currentTabId == id {
+            windowModel.currentTabId = fallbackTabId(excluding: id)
+        }
         refreshTabs()
+        handleTabSwitch()
+    }
+
+    // a favorite was closed: this window moves on if it was showing it
+    func favoriteClosed(_ id: UUID) {
+        guard currentTabId == id else { return }
+        windowModel.currentTabId = fallbackTabId(excluding: id)
         handleTabSwitch()
     }
 
@@ -621,39 +757,18 @@ class MainWindowController: NSWindowController {
 
     func loadTabs() {
         tabs = tabManager.orderedTabs(in: windowModel)
+        favoriteTabs = tabManager.favorites()
     }
 
+    // drops the pages of tabs that left this window, and lets go of web views this window no longer
+    // shows (pages gone, or favorites another window has taken). pages are made live only when shown.
     func syncStates() {
-        for tab in tabs where !tab.isSettings {
-            if browserStates[tab.id] == nil {
-                let initialURL = URL(string: tab.url)
-                let s = BrowserState(
-                    tabId: tab.id,
-                    tabManager: tabManager,
-                    historyManager: historyManager,
-                    initialURL: initialURL,
-                    interactionState: tab.interactionState,
-                    iconKey: tab.iconKey
-                )
-                s.onNewTabRequested = { [weak self] url, switchToTab in
-                    self?.createTab(url: url.absoluteString, switchTo: switchToTab)
-                }
-                s.onNewWindowRequested = { [weak self] url in
-                    self?.windowManager?.newWindow(url: url.absoluteString)
-                }
-                browserStates[tab.id] = s
-            }
-        }
-        let activeWebTabIds = Set(tabs.filter { !$0.isSettings }.map { $0.id })
-        for id in browserStates.keys where !activeWebTabIds.contains(id) {
+        let ids = Set(tabs.map(\.id))
+        for id in browserStates.keys where !ids.contains(id) {
             browserStates.removeValue(forKey: id)
         }
-
-        webContentVC.syncWebViews(
-            browserStates: browserStates,
-            tabs: tabs,
-            currentTabId: currentTabId
-        )
+        let hostedFavorites = favoriteTabs.map(\.id).filter { favorites?.host(of: $0) === self && favorites?.state(for: $0) != nil }
+        webContentVC.forgetWebViews(except: Set(browserStates.keys).union(hostedFavorites))
     }
 
     func updateWindowTitle() {
@@ -700,32 +815,25 @@ class MainWindowController: NSWindowController {
             toggleDownloadsPanel()
 
         case .showWebInspector:
-            browserStates[currentTabId ?? UUID()]?.toggleWebInspector()
+            currentBrowserState?.toggleWebInspector()
 
         case .refresh:
-            browserStates[currentTabId ?? UUID()]?.reload()
+            currentBrowserState?.reload()
 
         case .goBack:
-            browserStates[currentTabId ?? UUID()]?.goBack()
+            currentBrowserState?.goBack()
 
         case .goForward:
-            browserStates[currentTabId ?? UUID()]?.goForward()
+            currentBrowserState?.goForward()
 
-        case .previousTab:
-            guard let currentId = currentTabId,
-                  let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
-            let newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.count - 1
-            if newIndex >= 0 && newIndex < tabs.count {
-                selectTab(tabs[newIndex])
-            }
-
-        case .nextTab:
-            guard let currentId = currentTabId,
-                  let currentIndex = tabs.firstIndex(where: { $0.id == currentId }) else { return }
-            let newIndex = currentIndex < tabs.count - 1 ? currentIndex + 1 : 0
-            if newIndex >= 0 && newIndex < tabs.count {
-                selectTab(tabs[newIndex])
-            }
+        case .previousTab, .nextTab:
+            // through the open favorites, then the tabs, in the order the sidebar shows them
+            let order = favoriteTabs.filter { !$0.favoriteClosed || $0.id == currentTabId } + tabs
+            guard !order.isEmpty else { return }
+            let currentIndex = order.firstIndex(where: { $0.id == currentTabId })
+            let step = action == .nextTab ? 1 : -1
+            let newIndex = currentIndex.map { ($0 + step + order.count) % order.count } ?? (step > 0 ? 0 : order.count - 1)
+            selectTab(order[newIndex])
 
         case .focusURLBar:
             let recentTabs = tabs
@@ -750,13 +858,13 @@ class MainWindowController: NSWindowController {
             openSettings()
 
         case .zoomIn:
-            browserStates[currentTabId ?? UUID()]?.zoomIn()
+            currentBrowserState?.zoomIn()
 
         case .zoomOut:
-            browserStates[currentTabId ?? UUID()]?.zoomOut()
+            currentBrowserState?.zoomOut()
 
         case .resetZoom:
-            browserStates[currentTabId ?? UUID()]?.resetZoom()
+            currentBrowserState?.resetZoom()
         }
     }
 
@@ -981,7 +1089,7 @@ class MainWindowController: NSWindowController {
         if mode == .newTab {
             createTab(url: urlToLoad, switchTo: true)
         } else {
-            browserStates[currentTabId ?? UUID()]?.loadURL(urlToLoad)
+            currentBrowserState?.loadURL(urlToLoad)
         }
     }
 }
@@ -1006,15 +1114,15 @@ extension MainWindowController: SidebarDelegate {
     }
 
     func sidebarDidRequestBack() {
-        browserStates[currentTabId ?? UUID()]?.goBack()
+        currentBrowserState?.goBack()
     }
 
     func sidebarDidRequestForward() {
-        browserStates[currentTabId ?? UUID()]?.goForward()
+        currentBrowserState?.goForward()
     }
 
     func sidebarDidRequestReload() {
-        if let state = browserStates[currentTabId ?? UUID()] {
+        if let state = currentBrowserState {
             if state.isLoading { state.stopLoading() } else { state.reload() }
         }
     }
@@ -1022,12 +1130,12 @@ extension MainWindowController: SidebarDelegate {
     func sidebarDidSubmitURL(_ url: String) {
         if url.lowercased().hasPrefix("dawn://") {
             openSettings()
-        } else if let state = currentTabId.flatMap({ browserStates[$0] }) {
+        } else if let state = currentBrowserState {
             state.loadURL(url)
         } else {
             // a window without tabs gets one for what was typed
             let tab = createTab(url: "about:blank", switchTo: true)
-            browserStates[tab.id]?.loadURL(url)
+            state(for: tab.id)?.loadURL(url)
         }
     }
 
@@ -1038,7 +1146,8 @@ extension MainWindowController: SidebarDelegate {
     }
 
     func sidebarTabDragMoved(toScreen screenPoint: CGPoint, ids: [UUID]) {
-        windowManager?.tabDragMoved(to: screenPoint, source: self)
+        let favorites = Set(ids.filter { tab(for: $0)?.isFavorite == true })
+        windowManager?.tabDragMoved(to: screenPoint, source: self, pileSize: ids.count, favorites: favorites)
     }
 
     func sidebarTabDragEnded() {
@@ -1047,6 +1156,107 @@ extension MainWindowController: SidebarDelegate {
 
     func sidebarDidRequestDownloads() {
         toggleDownloadsPanel()
+    }
+
+    func sidebarCardTarget(atScreen screenPoint: CGPoint) -> (shape: CardShape, size: CGSize)? {
+        windowManager?.topmostController(under: screenPoint)?.sidebar?.cardTarget(atScreen: screenPoint)
+    }
+
+    func sidebarIsLive(_ id: UUID) -> Bool {
+        state(for: id) != nil
+    }
+
+    func sidebarDidPin(_ ids: [UUID], at index: Int) {
+        windowManager?.pin(ids, from: self, at: index)
+    }
+
+    func sidebarDidReorderFavorites(_ orderedIds: [UUID]) {
+        windowManager?.reorderFavorites(orderedIds)
+    }
+
+    func sidebarDidUnpin(_ id: UUID, at index: Int) {
+        windowManager?.unpin(id, into: self, at: index)
+    }
+
+    func sidebarHandOffFavorite(_ id: UUID, at screenPoint: CGPoint) -> SidebarViewController? {
+        windowManager?.handOffFavorite(id, from: self, at: screenPoint)
+    }
+
+    func sidebarMenu(for ids: [UUID]) -> NSMenu? {
+        let targets = ids.compactMap { tab(for: $0) }
+        guard let first = targets.first else { return nil }
+        let menu = NSMenu()
+        let many = targets.count > 1
+        func add(_ title: String, enabled: Bool = true, _ run: @escaping () -> Void) {
+            let action = MenuAction(run)
+            let item = NSMenuItem(title: title, action: #selector(MenuAction.runAction), keyEquivalent: "")
+            item.target = action
+            item.representedObject = action
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        let live = { (tab: Tab) in self.state(for: tab.id) != nil }
+        let url = { (tab: Tab) in self.state(for: tab.id)?.currentURL?.absoluteString ?? tab.url }
+        menu.autoenablesItems = false
+
+        if first.isFavorite {
+            add("Unpin Tab") { [weak self] in self?.unpinFromMenu(first.id) }
+        } else {
+            let pinnable = targets.filter { !$0.isSettings }
+            add(many ? "Pin \(pinnable.count) Tabs" : "Pin Tab", enabled: !pinnable.isEmpty) { [weak self] in
+                self?.pinFromMenu(pinnable.map(\.id))
+            }
+        }
+        menu.addItem(.separator())
+        add(many ? "Reload \(targets.count) Tabs" : "Reload Tab", enabled: targets.contains(where: live)) { [weak self] in
+            for tab in targets { self?.state(for: tab.id)?.reload() }
+        }
+        // copies go right after what they copy (a favorite's at the top of the tabs), the way they read
+        add(many ? "Duplicate \(targets.count) Tabs" : "Duplicate Tab", enabled: !targets.contains(where: \.isSettings)) { [weak self] in
+            guard let self else { return }
+            let after = targets.compactMap { tab in self.tabs.firstIndex(where: { $0.id == tab.id }) }.max().map { $0 + 1 } ?? 0
+            for (offset, tab) in targets.enumerated() { self.createTab(url: url(tab), switchTo: !many, at: after + offset) }
+        }
+        add(many ? "Copy Links" : "Copy Link") {
+            let text = many ? targets.map { "[\($0.title.isEmpty ? "Untitled" : $0.title)](\(url($0)))" }.joined(separator: "\n") : url(first)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
+        if !first.isFavorite {
+            menu.addItem(.separator())
+            add("Move to New Window") { [weak self] in
+                guard let self else { return }
+                self.windowManager?.moveToNewWindow(targets.map(\.id), from: self)
+            }
+        }
+        menu.addItem(.separator())
+        add(many ? "Close \(targets.count) Tabs" : "Close Tab", enabled: !first.isFavorite || live(first)) { [weak self] in
+            for tab in targets { self?.closeTab(tab) }
+        }
+        if !first.isFavorite, !many {
+            add("Close Other Tabs", enabled: tabs.count > 1) { [weak self] in
+                guard let self else { return }
+                for tab in self.tabs.filter({ $0.id != first.id }) { self.closeTab(tab) }
+            }
+        }
+        return menu
+    }
+
+    // pins tabs from the menu: each row flies up into its new tile
+    private func pinFromMenu(_ ids: [UUID]) {
+        guard !ids.isEmpty else { return }
+        let rects = sidebarVC.screenRects(for: ids)
+        sidebarVC.prepareMove(ids)
+        windowManager?.pin(ids, from: self, at: favoriteTabs.count)
+        sidebarVC.animateMove(ids, from: rects, shape: .row)
+    }
+
+    // unpins a favorite from the menu: its tile flies down into the top of this window's tabs
+    private func unpinFromMenu(_ id: UUID) {
+        let rects = sidebarVC.screenRects(for: [id])
+        sidebarVC.prepareMove([id])
+        windowManager?.unpin(id, into: self, at: 0)
+        sidebarVC.animateMove([id], from: rects, shape: .tile)
     }
 
     func sidebarDidReorderTabs(_ orderedTabIds: [UUID]) {
@@ -1058,6 +1268,19 @@ extension MainWindowController: SidebarDelegate {
         // Persist lazily (debounced) rather than a synchronous save here - a blocking disk flush froze
         // the drop animation. The in-memory order is already applied; quit/idle saves cover durability.
         tabManager.scheduleSave()
+    }
+}
+
+// a menu item's action, kept alive by the item
+final class MenuAction: NSObject {
+    private let run: () -> Void
+
+    init(_ run: @escaping () -> Void) {
+        self.run = run
+    }
+
+    @objc func runAction() {
+        run()
     }
 }
 

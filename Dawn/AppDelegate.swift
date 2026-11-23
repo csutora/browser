@@ -82,26 +82,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let active = DownloadManager.shared.activeItems.count
-        guard active > 0 else { return .terminateNow }
-        let alert = NSAlert()
-        alert.messageText = active == 1 ? "A download is in progress" : "\(active) downloads are in progress"
-        alert.informativeText = "Quitting will stop \(active == 1 ? "it" : "them")."
-        alert.addButton(withTitle: "Quit")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        if active > 0 {
+            let alert = NSAlert()
+            alert.messageText = active == 1 ? "A download is in progress" : "\(active) downloads are in progress"
+            alert.informativeText = "Quitting will stop \(active == 1 ? "it" : "them")."
+            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
+        // every live page is read into its tab first, so dawn opens back up to them as they were
+        windowManager.captureEverythingForTermination {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         DownloadManager.shared.discardPartialFiles()
-        // Persist interaction state for every open tab across all windows.
-        let tabs = tabManager.fetchTabs()
-        for c in windowManager.controllers {
-            for (tabId, state) in c.browserStates {
-                if let data = state.captureInteractionState(), let tab = tabs.first(where: { $0.id == tabId }) {
-                    tab.interactionState = data
-                }
-            }
-        }
         windowManager.persistAllForTermination()
     }
 
@@ -164,8 +161,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let develop = DevelopMenu(
             currentState: { [weak self] in self?.windowManager?.keyController?.currentBrowserState },
             allStates: { [weak self] in
-                self?.windowManager?.controllers.flatMap { Array($0.browserStates.values) } ?? []
-            }
+                guard let manager = self?.windowManager else { return [] }
+                return manager.controllers.flatMap { Array($0.browserStates.values) } + Array(manager.favorites.states.values)
+            },
+            unloadBackgroundTabs: { [weak self] in self?.windowManager?.unloader.unloadEverythingEligible() }
         )
         developMenu = develop
         mainMenu.addItem(develop.makeMenuItem())
@@ -241,6 +240,8 @@ final class WindowManager {
     let tabManager: TabManager
     let historyManager: HistoryManager
     let modelContext: ModelContext
+    let favorites: FavoritesController
+    private(set) var unloader: MemoryPressureUnloader!
     private(set) var controllers: [MainWindowController] = []
     private var isTerminating = false
     private weak var dragForeignTarget: MainWindowController?
@@ -261,6 +262,13 @@ final class WindowManager {
         self.tabManager = tabManager
         self.historyManager = historyManager
         self.modelContext = modelContext
+        self.favorites = FavoritesController(tabManager: tabManager, historyManager: historyManager)
+        unloader = MemoryPressureUnloader { [weak self] in self?.controllers ?? [] }
+        favorites.openTab = { [weak self] url, switchTo, host in
+            guard let self, let controller = host ?? self.keyController else { return }
+            controller.createTab(url: url.absoluteString, switchTo: switchTo)
+        }
+        favorites.openWindow = { [weak self] url in self?.newWindow(url: url.absoluteString) }
 
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged]
         hoverLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
@@ -308,6 +316,7 @@ final class WindowManager {
     }
 
     func restoreWindows() {
+        favorites.start()
         for wm in windowModels() { open(wm) }
         ensureAtLeastOneWindow()
     }
@@ -365,17 +374,59 @@ final class WindowManager {
     private func handleClose(_ controller: MainWindowController?) {
         guard let controller = controller else { return }
         controller.persistFrame()
-        controller.persistInteractionState()
         guard !isTerminating else { return }   // quit keeps every model for restore
 
         controllers.removeAll { $0 === controller }
+        favorites.forgetHost(controller)
         // Keep the last window's model (and tabs) so the next spawned window restores it; only delete
         // a window's model when other windows are still open.
         if !controllers.isEmpty {
             modelContext.delete(controller.windowModel)
+            try? modelContext.save()
+            return
         }
-        try? modelContext.save()
+        // the kept window's pages are read once the closed window has stopped showing them (the
+        // capture holds the controller until it's done)
+        controller.captureLiveTabs { [modelContext] in
+            _ = controller
+            try? modelContext.save()
+        }
     }
+
+    // dawn is quitting: its windows go first (which hides their pages, so their form fields get saved
+    // with them), then every live page is read into its tab. a page whose process doesn't answer within
+    // the time webkit itself gives a page before calling it unresponsive keeps what was last saved of it.
+    func captureEverythingForTermination(_ completion: @escaping () -> Void) {
+        isTerminating = true
+        for controller in controllers {
+            controller.persistFrame()
+            controller.window?.orderOut(nil)
+        }
+        let group = DispatchGroup()
+        for controller in controllers {
+            group.enter()
+            controller.captureLiveTabs { group.leave() }
+        }
+        for (id, state) in favorites.states {
+            group.enter()
+            state.captureState { [tabManager] page in
+                tabManager.savePage(id, page)
+                group.leave()
+            }
+        }
+        var finished = false
+        let finish = { [tabManager] in
+            guard !finished else { return }
+            finished = true
+            tabManager.saveNow()
+            completion()
+        }
+        group.notify(queue: .main, execute: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.webKitUnresponsiveInterval, execute: finish)
+    }
+
+    // how long webkit waits on a web content process before it reports the process unresponsive
+    private static let webKitUnresponsiveInterval: TimeInterval = 3
 
     func persistAllForTermination() {
         isTerminating = true
@@ -383,11 +434,49 @@ final class WindowManager {
         tabManager.saveNow()
     }
 
+    // MARK: - Favorites
+
+    // makes tabs of a window favorites, at a place among the favorites. their pages stay live, and the
+    // window keeps showing the one it was showing.
+    func pin(_ ids: [UUID], from controller: MainWindowController, at index: Int) {
+        let pinning = ids.compactMap { id in controller.tabs.first(where: { $0.id == id }) }.filter { !$0.isSettings }
+        guard !pinning.isEmpty else { return }
+        for tab in pinning {
+            if let state = controller.browserStates.removeValue(forKey: tab.id) {
+                favorites.adopt(state, hostedBy: controller)
+            }
+        }
+        tabManager.pin(pinning, at: index)
+        // favorites are always live: a tab pinned while unloaded starts its page now
+        for tab in pinning where favorites.state(for: tab.id) == nil {
+            favorites.ensureLive(tab).loadInitialContentIfNeeded()
+        }
+        // a window left without tabs of its own still shows the favorites
+    }
+
+    // turns a favorite back into an ordinary tab of `controller`, at a place among its tabs. its page
+    // stays live and moves into that window.
+    func unpin(_ id: UUID, into controller: MainWindowController, at index: Int) {
+        guard let tab = tabManager.favorites().first(where: { $0.id == id }) else { return }
+        if let state = favorites.release(id, keepingIn: controller) { controller.adopt(state) }
+        tabManager.unpin(tab, into: controller.windowModel, at: index)
+    }
+
+    func reorderFavorites(_ ids: [UUID]) {
+        tabManager.reorderFavorites(ids)
+    }
+
+    // closes a favorite in every window: its page goes, and it waits to be opened again
+    func closeFavorite(_ tab: Tab) {
+        favorites.close(tab)
+        for controller in controllers { controller.favoriteClosed(tab.id) }
+    }
+
     // MARK: - Cross-window drag coordination
 
     // Reported on each move of a tab drag (screen coords). Reveals/makes-space in whatever window the
     // cursor is over, so the whole multi-window set behaves like one tab system.
-    func tabDragMoved(to screenPoint: CGPoint, source: MainWindowController) {
+    func tabDragMoved(to screenPoint: CGPoint, source: MainWindowController, pileSize: Int, favorites dragged: Set<UUID>) {
         // Make space in the frontmost window under the cursor (z-order, so a window revealed behind via
         // cmd-` wins over the one it overlaps). The source makes its own space via its pile gap.
         let under = topmostController(under: screenPoint)
@@ -395,7 +484,7 @@ final class WindowManager {
         if dragForeignTarget !== foreign {
             dragForeignTarget?.endForeignTabDrag()
             dragForeignTarget = foreign
-            foreign?.beginForeignTabDrag()
+            foreign?.beginForeignTabDrag(pileSize: pileSize, excluding: dragged)
         }
         foreign?.updateForeignTabGap(atScreen: screenPoint)
     }
@@ -421,11 +510,49 @@ final class WindowManager {
     func handOffPile(_ ids: [UUID], from source: MainWindowController, at screenPoint: CGPoint) -> SidebarViewController? {
         if let target = topmostController(under: screenPoint) {
             if target === source { return nil }   // my own window/content: the source handles it
+            // over another window's favorites: the tabs become favorites (shared, so the source sees them
+            // too), caught by that window
+            let pinnable = ids.contains { id in source.tabs.first(where: { $0.id == id })?.isSettings == false }
+            if pinnable, let slot = target.sidebar?.favoritesInsertionIndex(atScreen: screenPoint) {
+                target.clearForeignTabDrag()
+                pin(ids, from: source, at: slot)
+                // the tabs were the source's own when the drag began, so like any move of its tabs
+                // elsewhere, a window left with none closes
+                finishSource(source)
+                return target.sidebar
+            }
             guard let slot = target.tabListInsertionIndex(atScreen: screenPoint) else { return nil }
             commitMove(ids, from: source, to: target, at: slot)
             return target.sidebar
         }
         return tearOffNewWindow(ids, from: source, at: screenPoint)?.sidebar
+    }
+
+    // a favorite dragged out of one window and dropped on another: over its tab list it becomes one of
+    // that window's tabs; over its favorites it just moves among them. anywhere else it springs back.
+    func handOffFavorite(_ id: UUID, from source: MainWindowController, at screenPoint: CGPoint) -> SidebarViewController? {
+        guard let target = topmostController(under: screenPoint), target !== source else { return nil }
+        if let slot = target.sidebar?.favoritesInsertionIndex(atScreen: screenPoint) {
+            target.clearForeignTabDrag()
+            // the slot is among the other favorites (the dragged one left its place in that window too)
+            var order = tabManager.favorites().map(\.id)
+            order.removeAll { $0 == id }
+            order.insert(id, at: min(slot, order.count))
+            reorderFavorites(order)
+            return target.sidebar
+        }
+        guard let slot = target.tabListInsertionIndex(atScreen: screenPoint) else { return nil }
+        target.clearForeignTabDrag()
+        unpin(id, into: target, at: slot)
+        target.window?.makeKeyAndOrderFront(nil)
+        return target.sidebar
+    }
+
+    // moves tabs into a new window of their own, beside the one they leave
+    func moveToNewWindow(_ ids: [UUID], from source: MainWindowController) {
+        guard let frame = source.window?.frame else { return }
+        let offset: CGFloat = 32
+        _ = tearOffNewWindow(ids, from: source, at: NSPoint(x: frame.minX + offset + 120, y: frame.maxY - offset - 24))
     }
 
     // MARK: - Moving tabs between windows
@@ -489,13 +616,7 @@ final class WindowManager {
     private func transferBrowserStates(_ ids: [UUID], from src: MainWindowController, to dst: MainWindowController) {
         for id in ids {
             guard let state = src.browserStates.removeValue(forKey: id) else { continue }
-            state.onNewTabRequested = { [weak dst] url, switchTo in
-                dst?.createTab(url: url.absoluteString, switchTo: switchTo)
-            }
-            state.onNewWindowRequested = { [weak dst] url in
-                dst?.windowManager?.newWindow(url: url.absoluteString)
-            }
-            dst.browserStates[id] = state
+            dst.adopt(state)
         }
     }
 

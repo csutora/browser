@@ -51,10 +51,12 @@ enum DevelopSettings {
 final class DevelopMenu: NSObject, NSMenuItemValidation {
     private let currentState: () -> BrowserState?
     private let allStates: () -> [BrowserState]
+    private let unloadBackgroundTabs: () -> Void
 
-    init(currentState: @escaping () -> BrowserState?, allStates: @escaping () -> [BrowserState]) {
+    init(currentState: @escaping () -> BrowserState?, allStates: @escaping () -> [BrowserState], unloadBackgroundTabs: @escaping () -> Void) {
         self.currentState = currentState
         self.allStates = allStates
+        self.unloadBackgroundTabs = unloadBackgroundTabs
     }
 
     func makeMenuItem() -> NSMenuItem {
@@ -87,6 +89,8 @@ final class DevelopMenu: NSObject, NSMenuItemValidation {
         agentItem.submenu = agents
         menu.addItem(agentItem)
         menu.addItem(.separator())
+        // what memory pressure does, to every background tab that can go now
+        add("Unload Background Tabs", #selector(unloadTabs))
         add("Trace Terminal Rendering", #selector(toggleTerminalTrace))
 
         let item = NSMenuItem(title: "Develop", action: nil, keyEquivalent: "")
@@ -140,6 +144,10 @@ final class DevelopMenu: NSObject, NSMenuItemValidation {
         DevelopSettings.javaScriptDisabled.toggle()
         // takes effect on the next navigation, so reload the page being looked at
         currentState()?.webView.reload()
+    }
+
+    @objc private func unloadTabs() {
+        unloadBackgroundTabs()
     }
 
     @objc private func toggleTerminalTrace() {

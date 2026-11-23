@@ -66,6 +66,37 @@ final class DawnWebView: WKWebView {
     }
 }
 
+// runs once the current pass of the main run loop is about to sleep, after every other observer of that
+// moment (webkit sends a web view's visibility changes on from one of them)
+func afterRunLoopPass(_ body: @escaping () -> Void) {
+    var fired = false
+    let observer = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue, true, CFIndex.max) { observer, _ in
+        guard !fired else { return }
+        fired = true
+        CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+        body()
+    }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+}
+
+// everything about a page that outlives its web view, so the page comes back as it was left after its
+// tab is unloaded or dawn quits: its history (each entry with its scroll position and form fields),
+// its session storage and its zoom
+struct SavedPage {
+    var interactionState: Data?
+    var sessionStorage: Data?
+    var zoom: Double = 1
+}
+
+// script messages go through this, since the web view's content controller keeps its handlers alive
+private final class ScriptMessageRelay: NSObject, WKScriptMessageHandler {
+    weak var state: BrowserState?
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        state?.userTyped()
+    }
+}
+
 // MARK: - Browser State (wraps WKWebView)
 class BrowserState: NSObject, ObservableObject {
     let webView: WKWebView
@@ -77,6 +108,7 @@ class BrowserState: NSObject, ObservableObject {
     let navigationDelegate: NavigationDelegate
 
     private var pendingURL: URL?
+    private var pendingSavedPage: SavedPage
     private var hasLoadedInitialContent = false
     private var lastStyledURL: URL?
     private var lastRecordedURL: String?
@@ -111,8 +143,6 @@ class BrowserState: NSObject, ObservableObject {
     private let maxZoom: Double = 3.0
     private let zoomStep: Double = 0.1
 
-    private var pendingInteractionState: Data?
-
     // KVO observations
     private var urlObservation: NSKeyValueObservation?
     private var titleObservation: NSKeyValueObservation?
@@ -131,7 +161,7 @@ class BrowserState: NSObject, ObservableObject {
         set { navigationDelegate.onNewWindowRequested = newValue }
     }
 
-    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil,
+    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, saved: SavedPage = SavedPage(),
          iconKey: String? = nil, showsIcon: Bool = true) {
         self.navigationDelegate = NavigationDelegate()
         self.iconKey = iconKey
@@ -143,9 +173,15 @@ class BrowserState: NSObject, ObservableObject {
         self.tabManager = tabManager
         self.historyManager = historyManager
         self.pendingURL = initialURL
-        self.pendingInteractionState = interactionState
+        self.pendingSavedPage = saved
+        self.currentZoom = saved.zoom
 
         super.init()
+
+        scriptRelay.state = self
+        let controller = webView.configuration.userContentController
+        controller.add(scriptRelay, contentWorld: Self.dawnWorld, name: "userInput")
+        controller.addUserScript(WKUserScript(source: Self.userInputScript, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: Self.dawnWorld))
 
         self.webView.navigationDelegate = navigationDelegate
         // web inspector access (also adds inspect element to the context menu); off by default for apps
@@ -165,12 +201,16 @@ class BrowserState: NSObject, ObservableObject {
     // decoded and ready to draw, or it's clear the page has none, so a tab is never caught without one.
     @Published private(set) var iconKey: String?
     private let showsIcon: Bool
-    private lazy var iconBridge = IconLoadingBridge { [weak self] in self?.iconOffered() }
+    private lazy var iconBridge = IconLoadingBridge { [weak self] touch in self?.iconOffered(touch: touch) }
     // which page the icon is being found for, counting each page that replaces the last
     private var iconPage = 0
     // the icon known to be this page's: one it loaded, or the one it was last seen with
     private var pageIconKey: String?
     private var pageIconDetail = -1
+    // a favorite's page also gets its touch icon (the larger one made for home screens), for a
+    // favorite's tile when its favicon is too small to show sharply there
+    private var pageTouchIconKey: String?
+    private var pageTouchIconDetail = -1
     private var iconLoadsPending = 0
     private var pageNavigation: WKNavigation?
     private var pageFinished = false
@@ -181,6 +221,8 @@ class BrowserState: NSObject, ObservableObject {
         iconLoadsPending = 0
         pageFinished = false
         pageIconDetail = -1
+        pageTouchIconKey = nil
+        pageTouchIconDetail = -1
         // a page seen before shows its icon at once (a page restored from the back-forward cache never
         // loads icons at all); what it loads replaces that if it differs
         pageIconKey = webView.url.flatMap { historyManager?.iconKey(for: $0.absoluteString) }
@@ -189,26 +231,31 @@ class BrowserState: NSObject, ObservableObject {
     }
 
     // webkit offers the page's icons before it reports the page finished
-    private func iconOffered() -> ((Data?) -> Void)? {
+    private func iconOffered(touch: Bool) -> ((Data?) -> Void)? {
+        if touch, tabManager?.tab(tabId)?.isFavorite != true { return nil }
         let page = iconPage
         iconLoadsPending += 1
         return { [weak self] data in
             guard let data, !data.isEmpty else {
-                self?.iconLoadEnded(page, nil)
+                self?.iconLoadEnded(page, nil, touch: touch)
                 return
             }
             Task.detached(priority: .utility) {
                 let prepared = IconStore.prepare(data)
-                await MainActor.run { self?.iconLoadEnded(page, prepared) }
+                await MainActor.run { self?.iconLoadEnded(page, prepared, touch: touch) }
             }
         }
     }
 
-    private func iconLoadEnded(_ page: Int, _ prepared: IconStore.Prepared?) {
+    private func iconLoadEnded(_ page: Int, _ prepared: IconStore.Prepared?, touch: Bool) {
         guard page == iconPage else { return }
         iconLoadsPending -= 1
         // of several icons, the most detailed one is kept
-        if let prepared, prepared.favicon.detail > pageIconDetail {
+        if let prepared, touch, prepared.favicon.detail > pageTouchIconDetail {
+            pageTouchIconDetail = prepared.favicon.detail
+            pageTouchIconKey = IconStore.shared.store(prepared)
+            tabManager?.updateTabTouchIcon(tabId, iconKey: pageTouchIconKey)
+        } else if let prepared, !touch, prepared.favicon.detail > pageIconDetail {
             pageIconDetail = prepared.favicon.detail
             pageIconKey = IconStore.shared.store(prepared)
             showIcon(pageIconKey)
@@ -226,6 +273,7 @@ class BrowserState: NSObject, ObservableObject {
     private func iconSettled() {
         guard pageFinished, iconLoadsPending == 0 else { return }
         showIcon(pageIconKey)
+        if tabManager?.tab(tabId)?.isFavorite == true { tabManager?.updateTabTouchIcon(tabId, iconKey: pageTouchIconKey) }
     }
 
     private func showIcon(_ key: String?) {
@@ -233,6 +281,79 @@ class BrowserState: NSObject, ObservableObject {
         guard key != iconKey else { return }
         iconKey = key
         tabManager?.updateTabIcon(tabId, iconKey: key)
+    }
+
+    // MARK: - Unloading
+
+    // typing a page received since it loaded. webkit restores only the form fields a page's html
+    // declares, not ones its scripts built, nor rich text, passwords or fields that opt out of
+    // autocomplete, and a script can't tell those apart reliably, so any typing at all keeps a page
+    // from being unloaded until it's replaced by another
+    private(set) var hasUserInput = false
+    // the page is what a form sent, which loading it again would send again
+    private(set) var isFormResult = false
+    private var requestedPageIsFormResult = false
+    private let scriptRelay = ScriptMessageRelay()
+
+    // dawn's own scripts run in a world of their own, which pages can't see or reach
+    private static let dawnWorld = WKContentWorld.world(name: "dawn")
+    private static let userInputScript = """
+    (() => {
+        let told = false
+        addEventListener('input', event => {
+            if (told || !event.isTrusted) return
+            told = true
+            webkit.messageHandlers.userInput.postMessage(null)
+        }, true)
+    })()
+    """
+
+    fileprivate func userTyped() {
+        hasUserInput = true
+    }
+
+    // whether the page can go away now and come back later as it was: not while it plays sound or
+    // video, records, shows fullscreen, is inspected or is still loading, and not once it holds typing
+    // or a form's result (see above)
+    func checkUnloadable(_ completion: @escaping (Bool) -> Void) {
+        func privateFlag(_ key: String) -> Bool {
+            webView.responds(to: NSSelectorFromString(key)) && (webView.value(forKey: key) as? Bool ?? false)
+        }
+        let capturingScreen = webView.responds(to: NSSelectorFromString("_displayCaptureState"))
+            && (webView.value(forKey: "_displayCaptureState") as? Int ?? 0) != WKMediaCaptureState.none.rawValue
+        guard hasLoadedInitialContent, !hasUserInput, !isFormResult, !webView.isLoading, !isWebInspectorVisible,
+              webView.fullscreenState == .notInFullscreen, webView.cameraCaptureState == .none,
+              webView.microphoneCaptureState == .none, !capturingScreen, !privateFlag("_isPlayingAudio") else {
+            return completion(false)
+        }
+        webView.requestMediaPlaybackState { state in completion(state != .playing) }
+    }
+
+    // the web content process showing the page, which exits once nothing shows a page in it
+    var webProcessIdentifier: pid_t? {
+        guard webView.responds(to: NSSelectorFromString("_webProcessIdentifier")),
+              let pid = webView.value(forKey: "_webProcessIdentifier") as? Int32, pid > 0 else { return nil }
+        return pid
+    }
+
+    // the page as it would come back, read once it has stopped being visible. webkit writes a page's
+    // form fields into its history entry only when the page is hidden, which it passes on at the end of
+    // the run loop pass that hid it; a round trip to the page's process after that comes back once what
+    // it saved has arrived.
+    func captureState(_ completion: @escaping (SavedPage) -> Void) {
+        // a page not loaded yet (or still being restored) is exactly what it was given
+        guard hasLoadedInitialContent, pendingSavedPage.interactionState == nil, pendingSavedPage.sessionStorage == nil else {
+            return completion(SavedPage(interactionState: pendingSavedPage.interactionState, sessionStorage: pendingSavedPage.sessionStorage, zoom: currentZoom))
+        }
+        // held until it's done, so whoever asked always hears back
+        afterRunLoopPass {
+            self.webView.evaluateJavaScript("0", in: nil, in: Self.dawnWorld) { _ in
+                let interaction = self.webView.interactionState as? Data
+                self.webView.fetchData(of: [.sessionStorage]) { session, _ in
+                    completion(SavedPage(interactionState: interaction, sessionStorage: session, zoom: self.currentZoom))
+                }
+            }
+        }
     }
 
     // the first dropped item replaces this tab's page, like safari; any others open in background tabs
@@ -266,9 +387,25 @@ class BrowserState: NSObject, ObservableObject {
             self?.hasProvisionalNavigation = false
             self?.publishCurrentURL()
         }
-        if showsIcon {
-            navigationDelegate.onCommit = { [weak self] navigation in self?.iconPageCommitted(navigation) }
-            navigationDelegate.onFinish = { [weak self] navigation in self?.iconPageFinished(navigation) }
+        navigationDelegate.onMainFrameRequest = { [weak self] request in
+            self?.requestedPageIsFormResult = request.httpMethod?.uppercased() == "POST"
+        }
+        navigationDelegate.onCommit = { [weak self] navigation in
+            guard let self else { return }
+            self.hasUserInput = false
+            self.isFormResult = self.requestedPageIsFormResult
+            if self.showsIcon { self.iconPageCommitted(navigation) }
+        }
+        navigationDelegate.onFinish = { [weak self] navigation in
+            guard let self else { return }
+            if self.showsIcon { self.iconPageFinished(navigation) }
+            // a page that finished without a title is named by its address, like safari does, rather
+            // than keeping whatever the tab was called before
+            if (self.webView.title ?? "").isEmpty, let url = self.webView.url, !url.absoluteString.hasPrefix("about:") {
+                let host = url.host ?? ""
+                let name = host.isEmpty ? url.absoluteString : host + (url.path == "/" ? "" : url.path)
+                self.tabManager?.updateTab(self.tabId, title: name)
+            }
         }
 
         urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, _ in
@@ -382,19 +519,30 @@ class BrowserState: NSObject, ObservableObject {
         guard !hasLoadedInitialContent else { return }
         hasLoadedInitialContent = true
 
+        webView.pageZoom = currentZoom
+
         // File URLs must be loaded with loadFileURL (load(URLRequest:) won't fetch file://, and
         // restoring interactionState doesn't reliably reload a local file - it comes back blank). So a
         // restored file tab loads fresh instead, trading its in-page back/forward for actually showing.
         if let url = pendingURL, url.isFileURL {
-            pendingInteractionState = nil
+            pendingSavedPage = SavedPage(zoom: currentZoom)
             loadFile(url)
             return
         }
 
+        // session storage goes back first, so a page that reads it while loading finds it
+        guard let session = pendingSavedPage.sessionStorage else { return loadSavedHistory() }
+        webView.restoreData(session) { [weak self] _ in
+            self?.pendingSavedPage.sessionStorage = nil
+            self?.loadSavedHistory()
+        }
+    }
+
+    private func loadSavedHistory() {
         // Restore interaction state if available (back/forward history)
-        if let stateData = pendingInteractionState {
+        if let stateData = pendingSavedPage.interactionState {
             webView.interactionState = stateData
-            pendingInteractionState = nil
+            pendingSavedPage.interactionState = nil
             return
         }
 
@@ -486,29 +634,25 @@ class BrowserState: NSObject, ObservableObject {
         webView.stopLoading()
     }
 
-    func captureInteractionState() -> Data? {
-        return webView.interactionState as? Data
-    }
-
     // MARK: - Zoom
 
+    // whole steps, so repeated zooming in and out lands back on exactly the same zoom
     func zoomIn() {
-        let newZoom = min(currentZoom + zoomStep, maxZoom)
-        setZoom(newZoom)
+        setZoom(min(((currentZoom + zoomStep) / zoomStep).rounded() * zoomStep, maxZoom))
     }
 
     func zoomOut() {
-        let newZoom = max(currentZoom - zoomStep, minZoom)
-        setZoom(newZoom)
+        setZoom(max(((currentZoom - zoomStep) / zoomStep).rounded() * zoomStep, minZoom))
     }
 
     func resetZoom() {
         setZoom(1.0)
     }
 
+    // the web view's own zoom, which holds across the tab's navigations and is kept with the tab
     private func setZoom(_ zoom: Double) {
         currentZoom = zoom
-        let js = "document.documentElement.style.zoom = '\(zoom)'"
-        webView.evaluateJavaScript(js, completionHandler: nil)
+        webView.pageZoom = zoom
+        tabManager?.updateTabZoom(tabId, zoom: zoom)
     }
 }

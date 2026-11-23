@@ -15,6 +15,8 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     var onProvisionalStart: (() -> Void)?
     var onProvisionalEnd: (() -> Void)?
     // a new page replaced the old one, and later finished loading (or stopped short of it)
+    // the request a main-frame navigation is about to make, before it's known whether it commits
+    var onMainFrameRequest: ((URLRequest) -> Void)?
     var onCommit: ((WKNavigation?) -> Void)?
     var onFinish: ((WKNavigation?) -> Void)?
 
@@ -77,6 +79,7 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             return
         }
 
+        if navigationAction.targetFrame?.isMainFrame == true { onMainFrameRequest?(navigationAction.request) }
         decisionHandler(.allow, preferences)
     }
 

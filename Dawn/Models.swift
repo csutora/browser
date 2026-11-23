@@ -18,12 +18,21 @@ final class Tab: Identifiable {
     var sortIndex: Int
     var tabTypeRaw: String = TabType.web.rawValue
     @Attribute(.externalStorage) var interactionState: Data?
+    @Attribute(.externalStorage) var sessionStorage: Data?
+    // a favorite: shown as a tile in every window, set to come back to this url when it's closed. it
+    // belongs to no window.
+    var pinnedURL: String?
+    var favoriteIndex: Int = 0
+    // a favorite that was closed: it waits to be opened again, or for dawn to start again
+    var favoriteClosed: Bool = false
     var scrollX: Double = 0.0
     var scrollY: Double = 0.0
     var zoomScale: Double = 1.0
     var backgroundColorHex: String?
     // the page's icon in the icon store; nil shows the placeholder
     var iconKey: String?
+    // a favorite's page's touch icon, for its tile when the icon is too small for it
+    var touchIconKey: String?
     var lastAccessedAt: Date = Date()
     // The window this tab belongs to. Inverse of WindowModel.tabs; nil only for legacy tabs before
     // the multi-window migration adopts them. sortIndex orders tabs within their window.
@@ -35,6 +44,16 @@ final class Tab: Identifiable {
     }
 
     var isSettings: Bool { tabType == .settings }
+    var isFavorite: Bool { pinnedURL != nil }
+
+    var savedPage: SavedPage {
+        get { SavedPage(interactionState: interactionState, sessionStorage: sessionStorage, zoom: zoomScale) }
+        set {
+            interactionState = newValue.interactionState
+            sessionStorage = newValue.sessionStorage
+            zoomScale = newValue.zoom
+        }
+    }
 
     var nsBackgroundColor: NSColor? {
         guard let hex = backgroundColorHex else { return nil }
@@ -96,13 +115,16 @@ final class WindowModel {
 
 // MARK: - Closed Tab Info (for reopen stack)
 struct ClosedTabInfo: Codable {
+    let id: UUID
     let title: String
     let url: String
     let sortIndex: Int
     let tabType: TabType
     let backgroundColorHex: String?
     let iconKey: String?
-    let interactionState: Data?
+    var interactionState: Data?
+    var sessionStorage: Data?
+    var zoom: Double = 1
 }
 
 // MARK: - Tab Manager
@@ -151,13 +173,13 @@ class TabManager: ObservableObject {
         guard let context = modelContext else { return }
         let windows = (try? context.fetch(FetchDescriptor<WindowModel>())) ?? []
         if let first = windows.min(by: { $0.orderIndex < $1.orderIndex }) {
-            let orphans = (try? context.fetch(FetchDescriptor<Tab>(predicate: #Predicate { $0.window == nil }))) ?? []
+            let orphans = (try? context.fetch(FetchDescriptor<Tab>(predicate: #Predicate { $0.window == nil && $0.pinnedURL == nil }))) ?? []
             guard !orphans.isEmpty else { return }
             for tab in orphans { tab.window = first }
         } else {
             let win = WindowModel(orderIndex: 0)
             context.insert(win)
-            for tab in fetchTabs() { tab.window = win }
+            for tab in fetchTabs() where !tab.isFavorite { tab.window = win }
             win.currentTabId = UserDefaults.standard.string(forKey: "currentTabId").flatMap { UUID(uuidString: $0) }
             if UserDefaults.standard.object(forKey: "isDocked") != nil {
                 win.isDocked = UserDefaults.standard.bool(forKey: "isDocked")
@@ -167,8 +189,11 @@ class TabManager: ObservableObject {
     }
 
     @discardableResult
-    func createTab(in window: WindowModel, url: String = "https://www.google.com", switchTo: Bool = false) -> Tab {
-        let t = Tab(url: url, sortIndex: window.tabs.count)
+    func createTab(in window: WindowModel, url: String = "https://www.google.com", switchTo: Bool = false, at index: Int? = nil) -> Tab {
+        let ordered = orderedTabs(in: window)
+        let at = min(index ?? ordered.count, ordered.count)
+        for existing in ordered where existing.sortIndex >= at { existing.sortIndex += 1 }
+        let t = Tab(url: url, sortIndex: at)
         modelContext?.insert(t)
         t.window = window
         if switchTo { window.currentTabId = t.id }
@@ -176,16 +201,18 @@ class TabManager: ObservableObject {
         return t
     }
 
-    func closeTab(_ tab: Tab, in window: WindowModel, interactionState: Data? = nil) {
+    // closes a tab, keeping what's needed to reopen it. a tab whose page was live has its state filled
+    // in once the page has been read (see closedTabStateCaptured); an unloaded one already holds it.
+    func closeTab(_ tab: Tab, in window: WindowModel) {
         guard let context = modelContext else { return }
         let closedId = tab.id
 
         if !tab.isSettings {
             var stack = closedTabsByWindow[window.id] ?? []
             stack.append(ClosedTabInfo(
-                title: tab.title, url: tab.url, sortIndex: tab.sortIndex,
+                id: tab.id, title: tab.title, url: tab.url, sortIndex: tab.sortIndex,
                 tabType: tab.tabType, backgroundColorHex: tab.backgroundColorHex, iconKey: tab.iconKey,
-                interactionState: interactionState
+                interactionState: tab.interactionState, sessionStorage: tab.sessionStorage, zoom: tab.zoomScale
             ))
             if stack.count > maxClosedTabs { stack.removeFirst() }
             closedTabsByWindow[window.id] = stack
@@ -212,7 +239,7 @@ class TabManager: ObservableObject {
         let t = Tab(title: info.title, url: info.url, sortIndex: insertAt, tabType: info.tabType)
         t.backgroundColorHex = info.backgroundColorHex
         t.iconKey = info.iconKey
-        t.interactionState = info.interactionState
+        t.savedPage = SavedPage(interactionState: info.interactionState, sessionStorage: info.sessionStorage, zoom: info.zoom)
         context.insert(t)
         t.window = window
         window.currentTabId = t.id
@@ -275,9 +302,107 @@ class TabManager: ObservableObject {
         NotificationCenter.default.post(name: .tabDataDidChange, object: id)
     }
 
+    func updateTabTouchIcon(_ id: UUID, iconKey: String?) {
+        guard let tab = tab(id), tab.touchIconKey != iconKey else { return }
+        tab.touchIconKey = iconKey
+        scheduleSave()
+        NotificationCenter.default.post(name: .tabDataDidChange, object: id)
+    }
+
+    func updateTabZoom(_ id: UUID, zoom: Double) {
+        guard let tab = tab(id) else { return }
+        tab.zoomScale = zoom
+        scheduleSave()
+    }
+
+    // keeps what a tab's page would come back as, for when its web view is gone
+    func savePage(_ id: UUID, _ page: SavedPage) {
+        guard let tab = tab(id) else { return }
+        tab.savedPage = page
+        scheduleSave()
+    }
+
+    // a closed tab's page, read after it was closed (it had to stop showing first)
+    func closedTabStateCaptured(_ id: UUID, _ page: SavedPage) {
+        for (window, stack) in closedTabsByWindow {
+            guard let index = stack.firstIndex(where: { $0.id == id }) else { continue }
+            closedTabsByWindow[window]?[index].interactionState = page.interactionState
+            closedTabsByWindow[window]?[index].sessionStorage = page.sessionStorage
+            closedTabsByWindow[window]?[index].zoom = page.zoom
+        }
+    }
+
+    // MARK: Favorites
+    //
+    // favorites belong to no window: every window shows all of them, and a favorite's page is one page,
+    // shown in whichever window is using it
+
+    // in order as they are now: sorted here rather than by the store, which sorts by what was last
+    // saved and so could hand back an order that's since changed
+    func favorites() -> [Tab] {
+        let descriptor = FetchDescriptor<Tab>(predicate: #Predicate { $0.pinnedURL != nil })
+        return ((try? modelContext?.fetch(descriptor)) ?? []).sorted { $0.favoriteIndex < $1.favoriteIndex }
+    }
+
+    // makes tabs favorites at a place among the favorites, set to come back to the page each shows now
+    func pin(_ tabs: [Tab], at index: Int) {
+        let pinning = Set(tabs.map(\.id))
+        var order = favorites().filter { !pinning.contains($0.id) }
+        order.insert(contentsOf: tabs, at: max(0, min(index, order.count)))
+        let windows = Set(tabs.compactMap(\.window).map(\.persistentModelID))
+        for tab in tabs {
+            tab.pinnedURL = tab.pinnedURL ?? tab.url
+            tab.favoriteClosed = false
+            tab.window = nil
+        }
+        for (i, tab) in order.enumerated() { tab.favoriteIndex = i }
+        for window in (try? modelContext?.fetch(FetchDescriptor<WindowModel>())) ?? [] where windows.contains(window.persistentModelID) {
+            for (i, tab) in orderedTabs(in: window).enumerated() { tab.sortIndex = i }
+        }
+        try? modelContext?.save()
+        NotificationCenter.default.post(name: .favoritesDidChange, object: nil)
+    }
+
+    // turns a favorite back into an ordinary tab of a window, at a place among its tabs
+    func unpin(_ tab: Tab, into window: WindowModel, at index: Int) {
+        var order = orderedTabs(in: window)
+        order.insert(tab, at: max(0, min(index, order.count)))
+        tab.pinnedURL = nil
+        tab.favoriteClosed = false
+        tab.window = window
+        for (i, t) in order.enumerated() { t.sortIndex = i }
+        for (i, t) in favorites().enumerated() { t.favoriteIndex = i }
+        try? modelContext?.save()
+        NotificationCenter.default.post(name: .favoritesDidChange, object: nil)
+    }
+
+    func reorderFavorites(_ ids: [UUID]) {
+        let all = favorites()
+        for (i, id) in ids.enumerated() { all.first(where: { $0.id == id })?.favoriteIndex = i }
+        try? modelContext?.save()
+        NotificationCenter.default.post(name: .favoritesDidChange, object: nil)
+    }
+
+    // a closed favorite forgets where it went: it comes back fresh at its pinned url
+    func closeFavorite(_ tab: Tab) {
+        tab.favoriteClosed = true
+        tab.url = tab.pinnedURL ?? tab.url
+        tab.savedPage = SavedPage()
+        try? modelContext?.save()
+        NotificationCenter.default.post(name: .favoritesDidChange, object: nil)
+    }
+
+    func openFavorite(_ tab: Tab) {
+        guard tab.favoriteClosed else { return }
+        tab.favoriteClosed = false
+        scheduleSave()
+        NotificationCenter.default.post(name: .favoritesDidChange, object: nil)
+    }
+
     // the icons of every tab, open or recently closed
     func iconKeys() -> Set<String> {
-        Set(fetchTabs().compactMap(\.iconKey) + closedTabsByWindow.values.joined().compactMap(\.iconKey))
+        let tabs = fetchTabs()
+        return Set(tabs.compactMap(\.iconKey) + tabs.compactMap(\.touchIconKey) + closedTabsByWindow.values.joined().compactMap(\.iconKey))
     }
 }
 
@@ -285,6 +410,7 @@ class TabManager: ObservableObject {
 extension Notification.Name {
     static let tabsDidChange = Notification.Name("tabsDidChange")
     static let tabDataDidChange = Notification.Name("tabDataDidChange")
+    static let favoritesDidChange = Notification.Name("favoritesDidChange")
     static let focusURLBar = Notification.Name("focusURLBar")
 }
 

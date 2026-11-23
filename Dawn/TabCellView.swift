@@ -5,12 +5,10 @@ class TabCellView: NSView {
     private var isSelected: Bool
     private var isHovered: Bool = false
     private var isDragging: Bool = false
-    // A live copy of the cell shown in the drag panel: no close button, transparent (the panel
-    // provides the lifted background), but otherwise the real thing so the title fade renders.
-    var isDragGhost: Bool = false { didSet { updateAppearance() } }
 
     var onSelect: ((NSEvent.ModifierFlags) -> Void)?
     var onClose: (() -> Void)?
+    var onMenu: ((NSEvent) -> NSMenu?)?
 
     // Part of a multi-selection (distinct from being the active tab). Shows the hover highlight.
     var isInSelection: Bool = false { didSet { updateAppearance() } }
@@ -129,23 +127,17 @@ class TabCellView: NSView {
         // Original: isSelected ? .primary : .secondary → .labelColor / .secondaryLabelColor
         titleLabel.textColor = isSelected ? .labelColor : .secondaryLabelColor
 
-        if isDragGhost {
-            // The panel behind it provides the lifted background; keep the cell itself transparent.
-            layer?.backgroundColor = NSColor.clear.cgColor
-            closeButton.isHidden = true
-        } else {
-            // Selection (0.05) reads over the active's stronger 0.1, since the active stays clear via
-            // its always-on close button and brighter title. 0.1 for a lone active tab, 0.05 for hover.
-            let alpha: CGFloat
-            if isInSelection { alpha = 0.05 }
-            else if isSelected { alpha = 0.1 }
-            else if isHovered { alpha = 0.05 }
-            else { alpha = 0 }
-            layer?.backgroundColor = alpha > 0
-                ? NSColor.labelColor.withAlphaComponent(alpha).cgColor
-                : NSColor.clear.cgColor
-            closeButton.isHidden = !(isSelected || isHovered)
-        }
+        // Selection (0.05) reads over the active's stronger 0.1, since the active stays clear via
+        // its always-on close button and brighter title. 0.1 for a lone active tab, 0.05 for hover.
+        let alpha: CGFloat
+        if isInSelection { alpha = 0.05 }
+        else if isSelected { alpha = 0.1 }
+        else if isHovered { alpha = 0.05 }
+        else { alpha = 0 }
+        layer?.backgroundColor = alpha > 0
+            ? NSColor.labelColor.withAlphaComponent(alpha).cgColor
+            : NSColor.clear.cgColor
+        closeButton.isHidden = !(isSelected || isHovered)
 
         needsLayout = true // the title reclaims the close button's space when it's hidden
     }
@@ -229,6 +221,26 @@ class TabCellView: NSView {
     override func mouseExited(with event: NSEvent) {
         isHovered = false
         updateAppearance()
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onMenu?(event)
+    }
+
+    // a tab in a window behind others can be picked up or chosen with the click that brings it forward
+    // (and a press on it never moves the window instead)
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    // the row takes every click on it but its close button's, its icon and title included (which would
+    // otherwise turn a first click down)
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        guard let hit else { return nil }
+        return hit.isDescendant(of: closeButton) ? hit : self
     }
 
     override func mouseDown(with event: NSEvent) {

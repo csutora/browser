@@ -22,6 +22,20 @@ protocol SidebarDelegate: AnyObject {
     func sidebarTabDragMoved(toScreen screenPoint: CGPoint, ids: [UUID])
     // The drag ended: clear any cross-window reveal / gap.
     func sidebarTabDragEnded()
+    // which shape and size dragged tabs take over a screen point in another window: a tile over its
+    // favorites, a row over its tab list, nil elsewhere
+    func sidebarCardTarget(atScreen screenPoint: CGPoint) -> (shape: CardShape, size: CGSize)?
+    // favorites: whether a favorite's page is running, and tabs pinned, favorites reordered or unpinned
+    // by dragging in this sidebar
+    func sidebarIsLive(_ id: UUID) -> Bool
+    func sidebarDidPin(_ ids: [UUID], at index: Int)
+    func sidebarDidReorderFavorites(_ orderedIds: [UUID])
+    func sidebarDidUnpin(_ id: UUID, at index: Int)
+    // a favorite dropped outside this window: commit it (unpinned into, or reordered from, the window
+    // under the cursor) and return that window's sidebar to catch it, or nil to spring it home
+    func sidebarHandOffFavorite(_ id: UUID, at screenPoint: CGPoint) -> SidebarViewController?
+    // the context menu for a tab or favorite, acting on these tabs
+    func sidebarMenu(for ids: [UUID]) -> NSMenu?
 }
 
 // MARK: - Sidebar View Controller
@@ -43,6 +57,7 @@ class SidebarViewController: NSViewController {
     private var urlFadeWrap: NSView!
     private var urlBar: NSTextField!
     private var dividerView: NSView!
+    private var favoritesView: FlippedView!
     private var scrollView: NSScrollView!
     private var tabListView: TabListDropView!
     private var footerView: NSView!
@@ -75,33 +90,50 @@ class SidebarViewController: NSViewController {
     private var foreignGapSlot: Int?
     private var foreignGap: Int? { foreignDragActive ? foreignGapSlot : nil }
 
-    private final class DragSession {
+    // where a dragged pile is: over the tab list, over the favorites, or neither
+    enum DropZone {
+        case list
+        case favorites
+        case none
+    }
+
+    fileprivate final class DragSession {
         let ids: [UUID]               // tabs being dragged, in list order
+        let source: CardShape         // dragged from the tab list (rows) or the favorites (tiles)
         var insertion: Int            // target slot among the non-dragged tabs
-        var overBar: Bool             // cursor currently over the list
+        var favoriteInsertion = 0     // target slot among the non-dragged favorites
+        var zone: DropZone
+        var shape: CardShape          // what the cards look like now
+        var overBar: Bool { zone == .list }
         var dropping = false          // committed: stop excluding the ids from the list layout
-        let grabOffsetListY: CGFloat  // grab point's offset within the grabbed cell (list coords)
+        var grabOffsetListY: CGFloat  // grab point's offset within the grabbed cell (list coords)
+        // where the cursor holds the top card, as shares of its width and of its height up from the
+        // bottom, fixed when it's picked up: whatever shape and size it turns into, it's held at the same
+        // proportions
+        var grabShareX: CGFloat = 0.5
+        var grabShareY: CGFloat = 0.5
+        var size: CGSize = .zero      // what size the cards are now
         let pickupCursor: CGPoint     // screen point of the original mouse-down (the grab anchor)
         let panelOrigin: CGPoint      // overlay panel origin in screen coords
         let panel: NSPanel            // full-screen click-through overlay holding the cards
         let container: NSView         // pile container, translated to follow the cursor
         var cards: [PileCard]
 
-        init(ids: [UUID], insertion: Int, overBar: Bool, grabOffsetListY: CGFloat, pickupCursor: CGPoint,
+        init(ids: [UUID], source: CardShape, insertion: Int, zone: DropZone, grabOffsetListY: CGFloat, pickupCursor: CGPoint,
              panelOrigin: CGPoint, panel: NSPanel, container: NSView, cards: [PileCard]) {
-            self.ids = ids; self.insertion = insertion; self.overBar = overBar
+            self.ids = ids; self.source = source; self.shape = source; self.insertion = insertion; self.zone = zone
             self.grabOffsetListY = grabOffsetListY; self.pickupCursor = pickupCursor
             self.panelOrigin = panelOrigin; self.panel = panel; self.container = container; self.cards = cards
         }
     }
 
-    private struct PileCard {
+    fileprivate struct PileCard {
         let id: UUID
         // Two views on purpose: position lives on `outer` (frame stays clean and settable), tilt lives
         // on `inner` via frameCenterRotation. AppKit owns layer.transform on layer-backed views, so a
         // single-view collapse can't hold a raw rotation - the split is the clean way to isolate them.
         let outer: NSView
-        let inner: NSView
+        let inner: DragCardView
         let homeOrigin: CGPoint
         let startOrigin: CGPoint
         let rotationDeg: CGFloat
@@ -110,7 +142,7 @@ class SidebarViewController: NSViewController {
 
     // Tabs lifted out of the list during a drag, laid out around a single gap at the insertion slot.
     private var reorderExcludedIds: Set<UUID> {
-        guard let drag = drag, !drag.dropping else { return [] }
+        guard let drag = drag, !drag.dropping, drag.source == .row else { return [] }
         return Set(drag.ids)
     }
 
@@ -189,6 +221,11 @@ class SidebarViewController: NSViewController {
         urlContainer.addSubview(urlFadeWrap)
         urlBar.autoresizingMask = [.width, .height]
         urlFadeWrap.addSubview(urlBar)
+
+        // Favorites, between the url bar and the tab list
+        favoritesView = FlippedView()
+        favoritesView.wantsLayer = true
+        container.addSubview(favoritesView)
 
         // Divider
         dividerView = NSView()
@@ -292,14 +329,29 @@ class SidebarViewController: NSViewController {
             return event
         }
 
+        // a drag can only end with the mouse let go over dawn: if dawn stops being the active app first
+        // (cmd-tab, another app taking the click), that never comes, so the pile springs home then
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, let drag = self.drag, !drag.dropping else { return }
+            self.delegate?.sidebarTabDragEnded()
+            drag.zone = .none
+            self.pileDragEnded(commit: false)
+        }
+
         self.view = container
     }
+
+    private var resignObserver: Any?
 
     deinit {
         if let obs = focusObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = unfocusObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = focusURLBarObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = resignObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = escMonitor { NSEvent.removeMonitor(obs) }
+        if let drag { drag.panel.close() }
     }
 
 
@@ -436,8 +488,12 @@ class SidebarViewController: NSViewController {
         urlBar.frame = urlFadeWrap.bounds
         refreshURLDisplay()   // the display cut depends on the width
 
-        // Divider: centered between URL bar bottom and tab list top
-        let dividerY = urlBarY - 14
+        // Favorites below the url bar, then the divider: centered between whatever is above it and the
+        // tab list top
+        let favoritesH = layoutFavorites()
+        let favoritesGap: CGFloat = favoritesH > 0 ? 12 : 0
+        favoritesView.frame = NSRect(x: 0, y: urlBarY - favoritesGap - favoritesH, width: w, height: favoritesH)
+        let dividerY = favoritesView.frame.minY - 14
         dividerView.frame = NSRect(x: 0, y: dividerY, width: w, height: 1)
 
         // Footer (bottom): new-tab button in the bottom-left corner with equal insets that
@@ -493,8 +549,10 @@ class SidebarViewController: NSViewController {
 
         let foreignGapIndex = self.foreignGap
         let excluded = self.reorderExcludedIds
+        // a pile from this sidebar (rows lifted out of the list, or a favorite's tile) hovering the list
+        let dragging = drag.map { !$0.dropping } ?? false
         let apply = {
-            if !excluded.isEmpty {
+            if dragging {
                 let others = self.tabs.filter { !excluded.contains($0.id) }
                 if self.drag?.overBar ?? false {
                     // Make-space: lay the other cells into every slot except the single gap the
@@ -534,6 +592,7 @@ class SidebarViewController: NSViewController {
         }
 
         if animated {
+            settleWhereShown(Array(tabCellViews.values) + [tabListView])
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.18
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -544,14 +603,15 @@ class SidebarViewController: NSViewController {
             apply()
         }
 
-        let totalH = m.slotY(tabs.count + (foreignGapIndex != nil ? 1 : 0)) + m.padV
+        let incoming = foreignGapIndex != nil || (dragging && drag?.source == .tile && drag?.overBar == true)
+        let totalH = m.slotY(tabs.count + (incoming ? 1 : 0)) + m.padV
         tabListView.frame = NSRect(x: 0, y: 0, width: m.width, height: max(totalH, scrollView.frame.height))
     }
 
     // MARK: - Helpers
 
     private func makeButton(symbolName: String, size: CGFloat, weight: NSFont.Weight = .semibold) -> NSButton {
-        let button = NSButton()
+        let button = SidebarButton()
         button.isBordered = false
         button.bezelStyle = .regularSquare
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
@@ -577,7 +637,142 @@ class SidebarViewController: NSViewController {
         view.needsLayout = true
     }
 
+    // MARK: - Favorites
+
+    private var favorites: [Tab] = []
+    private var tileViews: [UUID: FavoriteTileView] = [:]
+    // a pile from another window hovering this window's favorites: the slot it would land in
+    private var foreignFavoriteGap: Int?
+
+    // shows the favorites (shared by every window, so any window changing them changes all): tiles
+    // that stay move to their new places, new ones fade in where they land and gone ones fade out
+    func reloadFavorites(_ newFavorites: [Tab], animated: Bool) {
+        let ids = Set(newFavorites.map(\.id))
+        for (id, tile) in tileViews where !ids.contains(id) {
+            tileViews[id] = nil
+            guard animated, tile.alphaValue > 0 else { tile.removeFromSuperview(); continue }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.18
+                tile.animator().alphaValue = 0
+            }, completionHandler: { tile.removeFromSuperview() })
+        }
+        var appearing: [FavoriteTileView] = []
+        for tab in newFavorites where tileViews[tab.id] == nil {
+            let tile = makeTile(tab)
+            tileViews[tab.id] = tile
+            favoritesView.addSubview(tile)
+            appearing.append(tile)
+        }
+        favorites = newFavorites
+        for tab in newFavorites { updateTile(tab.id) }
+        // tiles still in flight from a drop (or about to fly in from a menu) stay hidden until they land
+        let flying = Set(drag?.ids ?? []).union(incomingIds)
+        for id in flying { tileViews[id]?.alphaValue = 0 }
+
+        // new tiles start where they'll be, so only the others move
+        for tile in appearing {
+            tile.frame = FavoriteMetrics(width: view.bounds.width, count: favorites.count)
+                .frame(favorites.firstIndex(where: { $0.id == tile.tab.id }) ?? 0)
+            if animated, !flying.contains(tile.tab.id) { tile.alphaValue = 0 }
+        }
+        relayout(animated: animated)
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                for tile in appearing where !flying.contains(tile.tab.id) { tile.animator().alphaValue = 1 }
+            }
+        }
+    }
+
+    private func makeTile(_ tab: Tab) -> FavoriteTileView {
+        let tile = FavoriteTileView(tab: tab)
+        tile.onSelect = { [weak self, weak tile] in
+            guard let self, let tab = tile?.tab else { return }
+            self.clearMultiSelection()
+            self.unfocusURLBar()
+            self.delegate?.sidebarDidSelectTab(tab)
+        }
+        tile.onMenu = { [weak self, weak tile] _ in
+            guard let self, let tab = tile?.tab else { return nil }
+            return self.delegate?.sidebarMenu(for: [tab.id])
+        }
+        tile.onDragStart = { [weak self] tile, _ in self?.tileDragBegan(tile) }
+        tile.onDragChanged = { [weak self] tile, event in self?.dragChanged(event, in: tile.window) }
+        tile.onDragEnded = { [weak self] tile, event in self?.dragEnded(event, in: tile.window) }
+        return tile
+    }
+
+    private func updateTile(_ id: UUID) {
+        guard let tile = tileViews[id], let tab = favorites.first(where: { $0.id == id }) else { return }
+        tile.update(tab: tab, isSelected: delegate?.currentTabId == id, isLive: delegate?.sidebarIsLive(id) ?? false)
+    }
+
+    // lays the tiles out (around the gap a dragged tab would land in) and returns the grid's height
+    @discardableResult
+    private func layoutFavorites() -> CGFloat {
+        let dragging = drag.map { !$0.dropping } ?? false
+        let excluded: Set<UUID> = (dragging && drag?.source == .tile ? Set(drag?.ids ?? []) : []).union(foreignExcluded)
+        let shown = favorites.filter { !excluded.contains($0.id) }
+        let gap = dragging && drag?.zone == .favorites ? drag?.favoriteInsertion : foreignFavoriteGap
+        // room for every tab in the pile, so the tiles are already where they'll be once it lands
+        let gapCount = gap != nil ? pileSize : 0
+        let metrics = FavoriteMetrics(width: view.bounds.width, count: shown.count + gapCount)
+        var slot = 0
+        for tab in shown {
+            if slot == gap { slot += gapCount }
+            tileViews[tab.id]?.frame = metrics.frame(slot)
+            slot += 1
+        }
+        return metrics.height
+    }
+
+    // how many tabs a pile over the favorites carries: this sidebar's own, or one from another window
+    private var foreignPileSize = 1
+    private var pileSize: Int { drag.map { $0.ids.count } ?? foreignPileSize }
+
+    // lays the sidebar out again, moving everything to its new place when animated
+    private func relayout(animated: Bool) {
+        guard animated, view.window != nil else { return layoutSidebar() }
+        settleWhereShown(Array(tileViews.values) + Array(tabCellViews.values) + [favoritesView, dividerView, scrollView, tabListView])
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
+            context.allowsImplicitAnimation = true
+            layoutSidebar()
+            view.layoutSubtreeIfNeeded()
+        }
+    }
+
+    // a new layout animation starts from where things are on screen. an animation still under way would
+    // otherwise be cut off at where it was headed, so when the layout changes again before the last
+    // change has settled (a gap following a fast drag), everything would snap ahead and back.
+    private func settleWhereShown(_ views: [NSView]) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for view in views {
+            guard let layer = view.layer, layer.animationKeys()?.isEmpty == false, let shown = layer.presentation() else { continue }
+            let frame = shown.frame
+            layer.removeAllAnimations()
+            view.frame = frame
+        }
+        CATransaction.commit()
+    }
+
+    // the slot dragged tabs would land in among the favorites, if the point is over where favorites are
+    // (the grid, the url bar and the sidebar's top), else nil
+    func favoritesInsertionIndex(atScreen screenPoint: CGPoint) -> Int? {
+        guard let window = view.window else { return nil }
+        let point = view.convert(window.convertPoint(fromScreen: screenPoint), from: nil)
+        guard view.bounds.contains(point), point.y > scrollView.frame.maxY else { return nil }
+        let excluded: Set<UUID> = (drag?.source == .tile ? Set(drag?.ids ?? []) : []).union(foreignExcluded)
+        let count = favorites.filter { !excluded.contains($0.id) }.count
+        let gridPoint = favoritesView.convert(point, from: view)
+        guard count > 0, gridPoint.y >= 0, gridPoint.y <= favoritesView.bounds.height else { return count }
+        return min(FavoriteMetrics(width: view.bounds.width, count: count + pileSize).slot(at: gridPoint), count)
+    }
+
     func updateTab(_ tabId: UUID) {
+        updateTile(tabId)
         guard let cell = tabCellViews[tabId],
               let tab = tabs.first(where: { $0.id == tabId }) else { return }
         cell.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
@@ -587,6 +782,7 @@ class SidebarViewController: NSViewController {
         for tab in tabs {
             tabCellViews[tab.id]?.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
         }
+        for tab in favorites { updateTile(tab.id) }
     }
 
     private var currentURLString = ""
@@ -691,30 +887,44 @@ class SidebarViewController: NSViewController {
             clearMultiSelection()
             ids = [cell.tab.id]
         }
-        beginPileDrag(grabbed: cell, ids: ids)
+        beginPileDrag(grabbed: cell, grabbedId: cell.tab.id, mouseDownInWindow: cell.mouseDownInWindow, ids: ids, source: .row)
     }
 
-    private func tabDragChanged(_ cell: TabCellView, _ event: NSEvent) {
-        guard let window = view.window else { return }
+    private func tileDragBegan(_ tile: FavoriteTileView) {
+        clearMultiSelection()
+        beginPileDrag(grabbed: tile, grabbedId: tile.tab.id, mouseDownInWindow: tile.mouseDownInWindow, ids: [tile.tab.id], source: .tile)
+    }
+
+    private func dragChanged(_ event: NSEvent, in window: NSWindow?) {
+        guard let window else { return }
         pileDragMoved(toScreen: window.convertPoint(toScreen: event.locationInWindow))
     }
 
-    private func tabDragEnded(_ cell: TabCellView, _ event: NSEvent) {
-        guard let drag = drag, let window = view.window else { return }
+    private func dragEnded(_ event: NSEvent, in window: NSWindow?) {
+        guard let drag = drag, let window else { return }
         let screenPoint = window.convertPoint(toScreen: event.locationInWindow)
         delegate?.sidebarTabDragEnded()   // clear cross-window reveal / gaps, whatever the outcome
 
-        // Dropped on my own list -> the standard reorder drop, right here.
-        if drag.overBar {
+        // Dropped on my own list or favorites -> the drop happens right here.
+        if drag.zone != .none {
             pileDragEnded(commit: true)
             return
         }
-        // Dropped over another window's list / outside all windows: the manager commits the model move
-        // and hands back the destination sidebar, which adopts THIS live pile and runs the exact same
-        // drop. So every window catches a dropped pile identically. nil -> nothing valid: spring home.
-        if let dest = delegate?.sidebarHandOffPile(drag.ids, at: screenPoint), dest !== self {
+        // Dropped over another window / outside all windows: the manager commits the model change and
+        // hands back the destination sidebar, which adopts THIS live pile and runs the exact same drop.
+        // So every window catches a dropped pile identically. nil -> nothing valid: spring home.
+        let dest = drag.source == .tile
+            ? drag.ids.first.flatMap { delegate?.sidebarHandOffFavorite($0, at: screenPoint) }
+            : delegate?.sidebarHandOffPile(drag.ids, at: screenPoint)
+        if let dest, dest !== self {
             self.drag = nil               // ownership of the overlay + cards transfers to dest
             dest.adoptPile(drag)
+            // favorites are in every window: this one shows its own tile of what it just gave away
+            relayout(animated: true)
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                for id in drag.ids { tileViews[id]?.animator().alphaValue = 1 }
+            }
             return
         }
         pileDragEnded(commit: false)      // spring back to where the tabs started
@@ -726,8 +936,16 @@ class SidebarViewController: NSViewController {
     // in-window one - it IS the same code, just on the window the pile landed on.
     private func adoptPile(_ session: DragSession) {
         clearForeignDrag()
+        cleanupPile()
         drag = session
-        for id in session.ids { tabCellViews[id]?.alphaValue = 0 }   // the scatter dissolves into them
+        session.dropping = true
+        for id in session.ids {   // the scatter dissolves into them (any fade-in they'd started stops)
+            for view in [tabCellViews[id], tileViews[id]].compactMap({ $0 as NSView? }) {
+                view.layer?.removeAnimation(forKey: "opacity")
+                view.alphaValue = 0
+            }
+        }
+        relayout(animated: true)
         pileDragEnded(commit: false)   // the move is already committed; just animate into place
     }
 
@@ -743,45 +961,83 @@ class SidebarViewController: NSViewController {
 
     // MARK: - Foreign drag (a pile from another window hovering this one)
 
-    func beginForeignDrag() {
+    // `excluding`: favorites the pile carries, which are this window's tiles too and leave their places
+    // here as well
+    func beginForeignDrag(pileSize: Int, excluding: Set<UUID>) {
         foreignDragActive = true
+        foreignPileSize = pileSize
+        foreignExcluded = excluding
+        for id in excluding { tileViews[id]?.alphaValue = 0 }
         foreignGapSlot = nil
+        foreignFavoriteGap = nil
         layoutTabCells(animated: true)
+        if !excluding.isEmpty { relayout(animated: true) }
     }
 
-    func updateForeignGap(_ slot: Int?) {
-        guard foreignDragActive, slot != foreignGapSlot else { return }
-        foreignGapSlot = slot
-        layoutTabCells(animated: true)
+    private var foreignExcluded: Set<UUID> = []
+
+    private func revealForeignExcluded() {
+        guard !foreignExcluded.isEmpty else { return }
+        let ids = foreignExcluded
+        foreignExcluded = []
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            for id in ids { tileViews[id]?.animator().alphaValue = 1 }
+        }
+    }
+
+    // opens a gap where the pile would land: in the tab list, or among the favorites
+    func updateForeignGap(atScreen screenPoint: CGPoint) {
+        guard foreignDragActive else { return }
+        let favoriteSlot = favoritesInsertionIndex(atScreen: screenPoint)
+        let listSlot = favoriteSlot == nil ? tabListInsertionIndex(atScreen: screenPoint) : nil
+        if favoriteSlot != foreignFavoriteGap {
+            foreignFavoriteGap = favoriteSlot
+            relayout(animated: true)
+        }
+        if listSlot != foreignGapSlot {
+            foreignGapSlot = listSlot
+            layoutTabCells(animated: true)
+        }
     }
 
     func endForeignDrag() {
         guard foreignDragActive else { return }
         foreignDragActive = false
         foreignGapSlot = nil
+        let hadFavoriteGap = foreignFavoriteGap != nil || !foreignExcluded.isEmpty
+        foreignFavoriteGap = nil
         layoutTabCells(animated: true)
+        revealForeignExcluded()
+        if hadFavoriteGap { relayout(animated: true) }
     }
 
     // Drop the phantom-gap flag without re-laying-out (the real moved cells take over immediately).
     func clearForeignDrag() {
         foreignDragActive = false
         foreignGapSlot = nil
+        foreignFavoriteGap = nil
+        foreignExcluded = []
     }
 
-    private func beginPileDrag(grabbed cell: TabCellView, ids: [UUID]) {
+    private func beginPileDrag(grabbed cell: NSView, grabbedId: UUID, mouseDownInWindow: NSPoint, ids: [UUID], source: CardShape) {
         guard let window = view.window else { return }
+        // a drop still settling ends now, so what's picked up is the real tab where it landed
+        cleanupPile()
         // Span every display so the pile stays visible across monitors: the whole gesture works in
         // global screen coordinates already, so one canvas over the union of all screens is all it
         // takes. Computed once here, so it just scales to however many monitors are attached.
         let screenFrame = NSScreen.screens.reduce(NSRect.null) { $0.union($1.frame) }
         guard !screenFrame.isEmpty else { return }
         let m = tabMetrics()
-        let cardSize = CGSize(width: m.cellW, height: m.cellH)
+        let cardSize = source == .tile ? cell.frame.size : CGSize(width: m.cellW, height: m.cellH)
         let idSet = Set(ids)
+        let items = source == .tile ? favorites : tabs
 
-        let grabbedIndex = tabs.firstIndex(where: { $0.id == cell.tab.id }) ?? 0
-        let insertion = tabs.prefix(grabbedIndex).filter { !idSet.contains($0.id) }.count
-        let grabOffsetListY = tabListView.convert(cell.mouseDownInWindow, from: nil).y - cell.frame.minY
+        let grabbedIndex = items.firstIndex(where: { $0.id == grabbedId }) ?? 0
+        let insertion = source == .row ? tabs.prefix(grabbedIndex).filter { !idSet.contains($0.id) }.count : tabs.count
+        // a tile held by its middle becomes a row held by its middle (see morphPile)
+        let grabOffsetListY = source == .row ? tabListView.convert(mouseDownInWindow, from: nil).y - cell.frame.minY : m.cellH / 2
 
         // Full-screen, click-through overlay. The pile container starts at the origin and is shifted
         // by the cursor delta to carry the whole pile; cards are positioned in its (screen-aligned)
@@ -794,32 +1050,33 @@ class SidebarViewController: NSViewController {
         container.wantsLayer = true
         content.addSubview(container)
 
-        let pickupCursor = window.convertPoint(toScreen: cell.mouseDownInWindow)
+        let pickupCursor = window.convertPoint(toScreen: mouseDownInWindow)
         let toLocal = { (p: CGPoint) -> CGPoint in CGPoint(x: p.x - screenFrame.minX, y: p.y - screenFrame.minY) }
+        let screenRect = { (v: NSView) -> NSRect in window.convertToScreen(v.convert(v.bounds, to: nil)) }
         // The grabbed tab is the flat top card, kept where it was dragged from so the cursor holds the
         // same spot on it; the pile tracks the cursor from there.
-        let topOrigin = toLocal(window.convertToScreen(tabListView.convert(cell.frame, to: nil)).origin)
+        let topOrigin = toLocal(screenRect(cell).origin)
 
         // Order the rest by distance from the grabbed tab (closest on top; ties favor the upper one).
-        let others = ids.filter { $0 != cell.tab.id }.sorted { a, b in
-            let ia = tabs.firstIndex(where: { $0.id == a }) ?? 0
-            let ib = tabs.firstIndex(where: { $0.id == b }) ?? 0
+        let others = ids.filter { $0 != grabbedId }.sorted { a, b in
+            let ia = items.firstIndex(where: { $0.id == a }) ?? 0
+            let ib = items.firstIndex(where: { $0.id == b }) ?? 0
             let da = abs(ia - grabbedIndex), db = abs(ib - grabbedIndex)
             return da != db ? da < db : ia < ib
         }
-        let ordered = [cell.tab.id] + others   // z order, top first
+        let ordered = [grabbedId] + others   // z order, top first
 
-        // Capture each tab's current list slot (screen -> local) before the list collapses.
+        // Capture each tab's current slot (screen -> local) before the list collapses.
         var startOrigins: [UUID: CGPoint] = [:]
         for id in ids {
-            if let c = tabCellViews[id] {
-                startOrigins[id] = toLocal(window.convertToScreen(tabListView.convert(c.frame, to: nil)).origin)
+            if let c: NSView = source == .tile ? tileViews[id] : tabCellViews[id] {
+                startOrigins[id] = toLocal(screenRect(c).origin)
             }
         }
 
         var built: [PileCard] = []
         for (z, id) in ordered.enumerated() {
-            guard let tab = tabs.first(where: { $0.id == id }) else { continue }
+            guard let tab = items.first(where: { $0.id == id }) else { continue }
             let hidden = z >= 5
             // Each non-top card is nudged a small random direction off the top card's center and
             // tilted a random way, for a loose hand-tossed pile rather than a neat ladder.
@@ -834,8 +1091,9 @@ class SidebarViewController: NSViewController {
             }
             let darken: CGFloat = z == 0 ? 0 : min(CGFloat(z) * 0.04, 0.2)
 
-            let inner = makeDragCard(tab: tab, appearance: cell.effectiveAppearance, size: cardSize, darken: darken)
-            inner.autoresizingMask = []
+            let inner = DragCardView(tab: tab, isSelected: delegate?.currentTabId == tab.id, appearance: cell.effectiveAppearance,
+                                     shape: source, size: cardSize, rowWidth: m.cellW, darken: darken)
+            inner.autoresizingMask = [.width, .height]
             inner.frame = NSRect(origin: .zero, size: cardSize)
             let outer = NSView(frame: NSRect(origin: homeOrigin, size: cardSize))
             outer.wantsLayer = true
@@ -849,13 +1107,46 @@ class SidebarViewController: NSViewController {
         for card in built.reversed() { container.addSubview(card.outer) }
         overlay.orderFront(nil)
 
-        drag = DragSession(ids: ids, insertion: insertion, overBar: true, grabOffsetListY: grabOffsetListY,
-                           pickupCursor: pickupCursor, panelOrigin: screenFrame.origin,
+        drag = DragSession(ids: ids, source: source, insertion: insertion, zone: source == .tile ? .favorites : .list,
+                           grabOffsetListY: grabOffsetListY, pickupCursor: pickupCursor, panelOrigin: screenFrame.origin,
                            panel: overlay, container: container, cards: built)
+        if source == .tile {
+            drag?.favoriteInsertion = grabbedIndex
+        }
+        // how the cursor holds the grabbed card, kept in every shape and size it takes
+        let grabbedRect = screenRect(cell)
+        drag?.grabShareX = (pickupCursor.x - grabbedRect.minX) / grabbedRect.width
+        drag?.grabShareY = (pickupCursor.y - grabbedRect.minY) / grabbedRect.height
+        drag?.size = cardSize
 
-        for id in ids { tabCellViews[id]?.alphaValue = 0 }
-        layoutTabCells(animated: true)
         gatherPile(cardSize: cardSize)
+        // the tabs leave their places once the cards are on screen: a window ordered in only shows a
+        // frame later, and hiding them now would leave that frame with neither
+        let session = drag
+        afterNextFrame { [weak self] in
+            guard let self, let session, self.drag === session, !session.dropping else { return }
+            for id in ids {
+                self.tabCellViews[id]?.alphaValue = 0
+                self.tileViews[id]?.alphaValue = 0
+            }
+            if source == .tile { self.relayout(animated: true) } else { self.layoutTabCells(animated: true) }
+        }
+    }
+
+    // runs once the display has shown the next frame of this window
+    private var frameWaits: [(CADisplayLink, () -> Void)] = []
+
+    private func afterNextFrame(_ body: @escaping () -> Void) {
+        let link = view.displayLink(target: self, selector: #selector(frameShown(_:)))
+        frameWaits.append((link, body))
+        link.add(to: .main, forMode: .common)
+    }
+
+    @objc private func frameShown(_ link: CADisplayLink) {
+        link.invalidate()
+        guard let index = frameWaits.firstIndex(where: { $0.0 === link }) else { return }
+        let body = frameWaits.remove(at: index).1
+        body()
     }
 
     // Spring every card from its list slot into the pile, all at once. Cards past the 5-card cap
@@ -880,8 +1171,8 @@ class SidebarViewController: NSViewController {
 
         // Fade the capped extras out a beat after the gather starts (tweak pileExtraFadeDelay).
         if drag.cards.contains(where: { $0.hidden }) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + pileExtraFadeDelay) { [weak self] in
-                guard self?.drag != nil else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + pileExtraFadeDelay) { [weak self, weak drag] in
+                guard let drag, self?.drag === drag, !drag.dropping else { return }
                 self?.fadePileExtras(visible: false, duration: 0.2)
             }
         }
@@ -899,35 +1190,116 @@ class SidebarViewController: NSViewController {
     // Driven by the dragging session, which hands us a screen point directly.
     private func pileDragMoved(toScreen cursor: NSPoint) {
         guard let drag = drag, let window = view.window else { return }
+        // a tab being carried is pointed at with the arrow, whatever it passes over (the url bar would
+        // otherwise leave a text cursor behind)
+        NSCursor.arrow.set()
         // Translate via the layer (not the frame) so the container's frame stays put and AppKit never
         // re-lays-out the cards mid-spring, which is what made the pile jump out from under the cursor.
         CATransaction.begin(); CATransaction.setDisableActions(true)
         drag.container.layer?.transform = CATransform3DMakeTranslation(cursor.x - drag.pickupCursor.x, cursor.y - drag.pickupCursor.y, 0)
         CATransaction.commit()
-        updateMakeSpaceGap(windowPoint: window.convertPoint(fromScreen: cursor))
+        updateMakeSpaceGap(cursor: cursor, windowPoint: window.convertPoint(fromScreen: cursor))
         // Let the window manager reveal / make space in whatever window the cursor is over.
         delegate?.sidebarTabDragMoved(toScreen: cursor, ids: drag.ids)
+        // the cards take the shape and size of where they'd land: tiles over favorites, rows over a tab
+        // list, as that window draws them (sidebars can differ in width), and keep both anywhere else
+        var target: (shape: CardShape, size: CGSize)?
+        switch drag.zone {
+        case .favorites: target = (.tile, cardSize(.tile))
+        case .list: target = (.row, cardSize(.row))
+        case .none: target = delegate?.sidebarCardTarget(atScreen: cursor)
+        }
+        let pinnable = drag.source == .tile || drag.ids.contains { id in tabs.first(where: { $0.id == id })?.isSettings == false }
+        if target?.shape == .tile, !pinnable { target = (.row, cardSize(.row)) }
+        if let target, target.shape != drag.shape || target.size != drag.size { morphPile(to: target.shape, size: target.size) }
     }
 
-    // The other cells open a single-tab gap at the slot the cursor hovers over (or close it when the
-    // cursor leaves the list).
-    private func updateMakeSpaceGap(windowPoint: CGPoint) {
+    // the shape and size a pile takes over this point of this window: a tile over its favorites, sized
+    // for the room they'd make; a row over its tab list. nil elsewhere.
+    func cardTarget(atScreen screenPoint: CGPoint) -> (shape: CardShape, size: CGSize)? {
+        if favoritesInsertionIndex(atScreen: screenPoint) != nil {
+            let others = favorites.filter { !foreignExcluded.contains($0.id) }.count
+            return (.tile, FavoriteMetrics(width: view.bounds.width, count: others + pileSize).frame(0).size)
+        }
+        if tabListInsertionIndex(atScreen: screenPoint) != nil {
+            return (.row, CGSize(width: tabMetrics().cellW, height: tabMetrics().cellH))
+        }
+        return nil
+    }
+
+    // The others open a single gap at the slot the cursor hovers over: among the tabs over the list,
+    // among the tiles over the favorites (or close it when the cursor leaves both).
+    private func updateMakeSpaceGap(cursor: CGPoint, windowPoint: CGPoint) {
         guard let drag = drag else { return }
         let m = tabMetrics()
-        let overBar = scrollView.frame.contains(view.convert(windowPoint, from: nil))
-        if overBar {
+        let wasZone = drag.zone, wasFavoriteInsertion = drag.favoriteInsertion
+        // settings can't be a favorite: a pile of nothing but settings isn't offered the favorites
+        let pinnable = drag.source == .tile || drag.ids.contains { id in tabs.first(where: { $0.id == id })?.isSettings == false }
+        if pinnable, let slot = favoritesInsertionIndex(atScreen: cursor) {
+            drag.zone = .favorites
+            drag.favoriteInsertion = slot
+        } else if scrollView.frame.contains(view.convert(windowPoint, from: nil)) {
             let maxInsertion = tabs.count - reorderExcludedIds.count
             let notionalTop = tabListView.convert(windowPoint, from: nil).y - drag.grabOffsetListY
             let center = notionalTop + m.cellH / 2
             let slot = max(0, min(Int(((center - m.slotY(0) - m.cellH / 2) / m.rowH).rounded()), maxInsertion))
-            if !drag.overBar || slot != drag.insertion {
-                drag.overBar = true
+            if wasZone != .list || slot != drag.insertion {
+                drag.zone = .list
                 drag.insertion = slot
                 layoutTabCells(animated: true)
+                if wasZone == .favorites { relayout(animated: true) }
             }
-        } else if drag.overBar {
-            drag.overBar = false
-            layoutTabCells(animated: true)
+            return
+        } else {
+            drag.zone = .none
+        }
+        if wasZone == .list { layoutTabCells(animated: true) }
+        if wasZone != drag.zone || wasFavoriteInsertion != drag.favoriteInsertion, wasZone == .favorites || drag.zone == .favorites {
+            relayout(animated: true)
+        }
+    }
+
+    // the size a card takes as a row, or as the tile it'd become where the pile hovers
+    private func cardSize(_ shape: CardShape) -> CGSize {
+        guard shape == .tile else { return CGSize(width: tabMetrics().cellW, height: tabMetrics().cellH) }
+        let others = favorites.filter { drag?.source != .tile || !(drag?.ids.contains($0.id) ?? false) }.count
+        let metrics = FavoriteMetrics(width: view.bounds.width, count: others + pileSize)
+        return metrics.frame(0).size
+    }
+
+    // every card turns into the new shape and size around the point the cursor holds, held at the same
+    // proportions it was picked up at (see DragSession), so the cursor stays at the same place on it
+    private func morphPile(to shape: CardShape, size: CGSize) {
+        guard let drag, let top = drag.cards.first else { return }
+        drag.shape = shape
+        drag.size = size
+        let cursor = CGPoint(x: drag.pickupCursor.x - drag.panelOrigin.x, y: drag.pickupCursor.y - drag.panelOrigin.y)
+        let topFrame = NSRect(x: cursor.x - drag.grabShareX * size.width, y: cursor.y - drag.grabShareY * size.height,
+                              width: size.width, height: size.height)
+        // where the list reads the pile's slot from: how far below the top card's top edge it's held
+        drag.grabOffsetListY = topFrame.maxY - cursor.y
+        let topOrigin = top.outer.frame.origin
+        let timing = CAMediaTimingFunction(controlPoints: 0.3, 1.2, 0.4, 1)
+        let duration: TimeInterval = 0.32
+        for card in drag.cards {
+            // the rest of the pile keeps its place around the top card
+            let offset = CGPoint(x: card.outer.frame.minX - topOrigin.x, y: card.outer.frame.minY - topOrigin.y)
+            let frame = topFrame.offsetBy(dx: offset.x, dy: offset.y)
+            // a morph still under way carries on from where it is now, rather than from where it was headed
+            if let layer = card.outer.layer, let shown = layer.presentation() {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.removeAllAnimations()
+                card.outer.frame = shown.frame
+                CATransaction.commit()
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                context.timingFunction = timing
+                context.allowsImplicitAnimation = true
+                card.outer.frame = frame
+            }
+            card.inner.morph(to: shape, size: size, duration: duration, timing: timing)
         }
     }
 
@@ -935,25 +1307,40 @@ class SidebarViewController: NSViewController {
         guard let drag = drag, let window = view.window else { cleanupPile(); return }
         let ids = drag.ids
 
-        if commit {
-            // Drop the dragged group contiguous at the insertion slot. When not committing (dropped
-            // outside the list, e.g. exported as markdown to another app), the order is left untouched
-            // so the cards simply spring back to where they started.
-            let idSet = Set(ids)
-            let group = ids.compactMap { id in tabs.first(where: { $0.id == id }) }
-            var remaining = tabs.filter { !idSet.contains($0.id) }
-            remaining.insert(contentsOf: group, at: min(drag.insertion, remaining.count))
-            tabs = remaining
-            for (index, tab) in tabs.enumerated() { tab.sortIndex = index }
-            delegate?.sidebarDidReorderTabs(tabs.map { $0.id })
-        }
-
-        // Lay the (still-hidden) real cells into their final slots so we can read fly-back targets.
+        // the real cells and tiles are laid into their final slots from here on (still hidden), so
+        // fly-back targets can be read from them, and so the model changes below lay out cleanly
         drag.dropping = true
+        for id in ids {
+            tabCellViews[id]?.alphaValue = 0
+            tileViews[id]?.alphaValue = 0
+        }
+        if commit {
+            // Drop the dragged group contiguous at its slot. When not committing (dropped outside the
+            // sidebar, e.g. exported as markdown to another app), nothing changes and the cards simply
+            // spring back to where they started.
+            let idSet = Set(ids)
+            switch (drag.source, drag.zone) {
+            case (.row, .list):
+                let group = ids.compactMap { id in tabs.first(where: { $0.id == id }) }
+                var remaining = tabs.filter { !idSet.contains($0.id) }
+                remaining.insert(contentsOf: group, at: min(drag.insertion, remaining.count))
+                tabs = remaining
+                for (index, tab) in tabs.enumerated() { tab.sortIndex = index }
+                delegate?.sidebarDidReorderTabs(tabs.map { $0.id })
+            case (.row, .favorites):
+                delegate?.sidebarDidPin(ids, at: drag.favoriteInsertion)
+            case (.tile, .favorites):
+                var order = favorites.map(\.id).filter { !idSet.contains($0) }
+                order.insert(contentsOf: ids, at: min(drag.favoriteInsertion, order.count))
+                delegate?.sidebarDidReorderFavorites(order)
+            case (.tile, .list):
+                if let id = ids.first { delegate?.sidebarDidUnpin(id, at: drag.insertion) }
+            default:
+                break
+            }
+        }
         layoutTabCells()
-
-        let m = tabMetrics()
-        let cardSize = CGSize(width: m.cellW, height: m.cellH)
+        layoutSidebar()
 
         // Bake the cursor-follow translation into each card's position and drop the container shift,
         // so the scatter springs run in a static frame.
@@ -961,53 +1348,164 @@ class SidebarViewController: NSViewController {
         let shift = CGPoint(x: t.m41, y: t.m42)
         CATransaction.begin(); CATransaction.setDisableActions(true)
         drag.container.layer?.transform = CATransform3DIdentity
+        var pileFrames: [UUID: NSRect] = [:]
         for card in drag.cards {
-            card.outer.layer?.removeAnimation(forKey: "gather-pos")
-            card.outer.frame = NSRect(origin: CGPoint(x: card.homeOrigin.x + shift.x, y: card.homeOrigin.y + shift.y), size: cardSize)
+            // from exactly where it shows now: a gather or morph still under way stops there (left
+            // running, it would carry on in the coordinates from before the shift and jump back)
+            let shown = card.outer.layer?.presentation()?.frame ?? card.outer.frame
+            card.outer.layer?.removeAllAnimations()
+            let frame = shown.offsetBy(dx: shift.x, dy: shift.y)
+            card.outer.frame = frame
+            pileFrames[card.id] = frame
         }
         CATransaction.commit()
+        // what's shown takes those frames now, before anything animates from them: an animation started
+        // in this same pass would start from what was last shown (from before the shift) and jump back
+        CATransaction.flush()
 
         // The hidden extras fade back in right as the scatter starts, so the fan-out is seamless.
         fadePileExtras(visible: true, duration: 0.08)
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
+        // each card flies to where its tab now is: a row in the list or a favorite's tile. one that
+        // changes shape on the way morphs as it flies; the rest spring as they always have.
         for card in drag.cards {
-            guard let cell = tabCellViews[card.id] else { continue }
-            let slotScreen = window.convertToScreen(tabListView.convert(cell.frame, to: nil))
-            let targetOrigin = CGPoint(x: slotScreen.minX - drag.panelOrigin.x, y: slotScreen.minY - drag.panelOrigin.y)
-            let pileOrigin = CGPoint(x: card.homeOrigin.x + shift.x, y: card.homeOrigin.y + shift.y)
+            let target: NSView? = tileViews[card.id] ?? tabCellViews[card.id]
+            guard let target, let pileFrame = pileFrames[card.id] else { continue }
+            let shape: CardShape = tileViews[card.id] != nil ? .tile : .row
+            let slotScreen = window.convertToScreen(target.convert(target.bounds, to: nil))
+            let targetFrame = NSRect(x: slotScreen.minX - drag.panelOrigin.x, y: slotScreen.minY - drag.panelOrigin.y,
+                                     width: slotScreen.width, height: slotScreen.height)
             card.inner.frameCenterRotation = 0
-            card.outer.frame = NSRect(origin: targetOrigin, size: cardSize)
+            if shape != card.inner.shape || targetFrame.size != pileFrame.size {
+                let timing = CAMediaTimingFunction(controlPoints: 0.3, 1.15, 0.4, 1)
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = pileMorphDuration
+                    context.timingFunction = timing
+                    context.allowsImplicitAnimation = true
+                    card.outer.frame = targetFrame
+                }
+                card.inner.morph(to: shape, size: targetFrame.size, duration: pileMorphDuration, timing: timing)
+                continue
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            card.outer.frame = targetFrame
+            CATransaction.commit()
             guard let layer = card.outer.layer else { continue }
             let toPos = layer.position
-            let fromPos = CGPoint(x: toPos.x + (pileOrigin.x - targetOrigin.x), y: toPos.y + (pileOrigin.y - targetOrigin.y))
+            let fromPos = CGPoint(x: toPos.x + (pileFrame.minX - targetFrame.minX), y: toPos.y + (pileFrame.minY - targetFrame.minY))
             layer.add(pileSpring("position", from: NSValue(point: fromPos), to: NSValue(point: toPos)), forKey: "scatter-pos")
         }
-        CATransaction.commit()
 
         // Reveal the real cells underneath and dissolve the pile cards out over them (hides the handoff
         // jitter). Started partway into the scatter rather than at settle, so the drop feels snappy.
+        // each step belongs to this drop: a drag started before it's done finishes it at once, and
+        // whatever was still to come of it does nothing
         DispatchQueue.main.asyncAfter(deadline: .now() + pileDropFadeDelay) { [weak self] in
-            guard let self = self, self.drag != nil else { return }
-            for id in ids { self.tabCellViews[id]?.alphaValue = 1 }
+            guard let self = self, self.drag === drag else { return }
+            for id in ids {
+                self.tabCellViews[id]?.alphaValue = 1
+                self.tileViews[id]?.alphaValue = 1
+            }
             self.clearMultiSelection()
-            let cards = self.drag?.cards ?? []
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.2
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                for card in cards { card.outer.animator().alphaValue = 0 }
+                for card in drag.cards { card.outer.animator().alphaValue = 0 }
             }, completionHandler: { [weak self] in
-                self?.cleanupPile()
+                self?.finish(drag)
             })
         }
     }
 
     private func cleanupPile() {
-        if let ids = drag?.ids { for id in ids { tabCellViews[id]?.alphaValue = 1 } }
-        drag?.panel.close()
+        if let drag { finish(drag) }
+    }
+
+    // a drag (or a drop still settling) is over: its cards go and the tabs it carried show where they are
+    private func finish(_ session: DragSession) {
+        session.panel.close()
+        guard drag === session else { return }
+        for id in session.ids {
+            for view in [tabCellViews[id], tileViews[id]].compactMap({ $0 as NSView? }) {
+                view.layer?.removeAnimation(forKey: "opacity")
+                view.alphaValue = 1
+            }
+        }
         drag = nil
         layoutTabCells()
+        layoutSidebar()
+        // whatever's under the cursor now (often the tab just dropped) shows it
+        for cell in tabCellViews.values { cell.refreshHover() }
+        for tile in tileViews.values { tile.refreshHover() }
+    }
+
+    // how long a card takes to turn into a row or a tile as it lands
+    private let pileMorphDuration: TimeInterval = 0.36
+
+    // moves tabs between the tab list and the favorites (pinned or unpinned from a menu) by flying
+    // cards from where they were to where they now are, turning into their new shape on the way. the
+    // model has already changed; the rects are where they were, in screen coordinates.
+    func animateMove(_ ids: [UUID], from rects: [UUID: NSRect], shape: CardShape) {
+        cleanupPile()
+        guard let window = view.window else {
+            incomingIds = []
+            return
+        }
+        let screenFrame = NSScreen.screens.reduce(NSRect.null) { $0.union($1.frame) }
+        let overlay = makeFloatingDragPanel(contentRect: screenFrame)
+        let content = NSView(frame: NSRect(origin: .zero, size: screenFrame.size))
+        content.wantsLayer = true
+        overlay.contentView = content
+        let container = NSView(frame: content.bounds)
+        container.wantsLayer = true
+        content.addSubview(container)
+        var cards: [PileCard] = []
+        for id in ids {
+            guard let rect = rects[id], let tab = favorites.first(where: { $0.id == id }) ?? tabs.first(where: { $0.id == id }) else { continue }
+            let origin = CGPoint(x: rect.minX - screenFrame.minX, y: rect.minY - screenFrame.minY)
+            let inner = DragCardView(tab: tab, isSelected: delegate?.currentTabId == id, appearance: view.effectiveAppearance,
+                                     shape: shape, size: rect.size, rowWidth: tabMetrics().cellW, darken: 0)
+            inner.autoresizingMask = [.width, .height]
+            let outer = NSView(frame: NSRect(origin: origin, size: rect.size))
+            outer.wantsLayer = true
+            outer.addSubview(inner)
+            container.addSubview(outer)
+            cards.append(PileCard(id: id, outer: outer, inner: inner, homeOrigin: origin, startOrigin: origin, rotationDeg: 0, hidden: false))
+        }
+        incomingIds = []
+        guard !cards.isEmpty else {
+            overlay.close()
+            for id in ids {
+                tabCellViews[id]?.alphaValue = 1
+                tileViews[id]?.alphaValue = 1
+            }
+            return
+        }
+        overlay.orderFront(nil)
+        let pickup = window.convertPoint(toScreen: window.mouseLocationOutsideOfEventStream)
+        let session = DragSession(ids: cards.map(\.id), source: shape, insertion: 0, zone: .none, grabOffsetListY: 0, pickupCursor: pickup,
+                                  panelOrigin: screenFrame.origin, panel: overlay, container: container, cards: cards)
+        adoptPile(session)
+    }
+
+    // tabs about to move between the list and the favorites by animateMove: their new row or tile
+    // stays hidden until the card lands on it
+    private var incomingIds: Set<UUID> = []
+
+    func prepareMove(_ ids: [UUID]) {
+        incomingIds = Set(ids)
+    }
+
+    // where tabs are right now, in screen coordinates, for animateMove
+    func screenRects(for ids: [UUID]) -> [UUID: NSRect] {
+        guard let window = view.window else { return [:] }
+        var rects: [UUID: NSRect] = [:]
+        for id in ids {
+            guard let v: NSView = tileViews[id] ?? tabCellViews[id], v.superview != nil else { continue }
+            rects[id] = window.convertToScreen(v.convert(v.bounds, to: nil))
+        }
+        return rects
     }
 
     // Delay from grabbing the stack to the capped extras fading out. Tune to taste.
@@ -1041,71 +1539,6 @@ class SidebarViewController: NSViewController {
         // have separate Spaces" on (the default).
         panel.collectionBehavior = [.transient, .ignoresCycle, .fullScreenAuxiliary, .canJoinAllSpaces]
         return panel
-    }
-
-    // A lifted tab card: the sidebar's vibrant material + dark overlay (so it tints with the page
-    // content like the sidebar) + the hovered-tab highlight, with a live ghost cell rendering the
-    // title (and its fade). Deeper pile cards pass a larger darken.
-    private func makeDragCard(tab: Tab, appearance: NSAppearance?, size: CGSize, darken: CGFloat = 0) -> NSView {
-        let card = NSView(frame: NSRect(origin: .zero, size: size))
-        card.wantsLayer = true
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        card.layer?.allowsEdgeAntialiasing = true
-        card.layer?.contentsScale = scale
-        // Clip to the rounded rect with a shape-layer mask rather than masksToBounds, so the corners
-        // stay antialiased when the card is rotated in the pile (a layer cornerRadius/border aliases
-        // hard off-axis). The border is a stroked shape layer for the same reason.
-        let clip = CAShapeLayer()
-        clip.path = CGPath(roundedRect: NSRect(origin: .zero, size: size), cornerWidth: 8, cornerHeight: 8, transform: nil)
-        card.layer?.mask = clip
-        card.autoresizingMask = [.width, .height]
-        card.appearance = appearance
-
-        let effect = NSVisualEffectView(frame: card.bounds)
-        effect.material = .hudWindow
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.autoresizingMask = [.width, .height]
-        card.addSubview(effect)
-
-        let overlay = NSView(frame: card.bounds)
-        overlay.wantsLayer = true
-        overlay.layer?.backgroundColor = NSColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 0.4).cgColor
-        overlay.autoresizingMask = [.width, .height]
-        card.addSubview(overlay)
-
-        let highlight = NSView(frame: card.bounds)
-        highlight.wantsLayer = true
-        highlight.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
-        highlight.autoresizingMask = [.width, .height]
-        card.addSubview(highlight)
-
-        if darken > 0 {
-            let shade = NSView(frame: card.bounds)
-            shade.wantsLayer = true
-            shade.layer?.backgroundColor = NSColor.black.withAlphaComponent(darken).cgColor
-            shade.autoresizingMask = [.width, .height]
-            card.addSubview(shade)
-        }
-
-        let ghost = TabCellView(tab: tab, isSelected: delegate?.currentTabId == tab.id)
-        ghost.isDragGhost = true
-        ghost.appearance = appearance
-        ghost.frame = card.bounds
-        ghost.autoresizingMask = [.width, .height]
-        card.addSubview(ghost)
-
-        // Stroked border on top of everything, concentric with the clip; antialiases under rotation.
-        let border = CAShapeLayer()
-        border.path = CGPath(roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
-                             cornerWidth: 7.5, cornerHeight: 7.5, transform: nil)
-        border.fillColor = NSColor.clear.cgColor
-        border.strokeColor = NSColor.white.withAlphaComponent(0.1).cgColor
-        border.lineWidth = 1
-        border.contentsScale = scale
-        border.zPosition = 1000
-        card.layer?.addSublayer(border)
-        return card
     }
 
     // MARK: - Multi-selection
@@ -1200,16 +1633,26 @@ class SidebarViewController: NSViewController {
                     self?.tabDragBegan(cell, event)
                 }
                 cell.onDragChanged = { [weak self] cell, event in
-                    self?.tabDragChanged(cell, event)
+                    self?.dragChanged(event, in: cell.window)
                 }
                 cell.onDragEnded = { [weak self] cell, event in
-                    self?.tabDragEnded(cell, event)
+                    self?.dragEnded(event, in: cell.window)
+                }
+                cell.onMenu = { [weak self, weak cell] _ in
+                    guard let self, let id = cell?.tab.id else { return nil }
+                    // a tab that's part of a multi-selection acts for the whole selection
+                    let ids = self.selectedTabIds.count > 1 && self.selectedTabIds.contains(id)
+                        ? self.tabs.map(\.id).filter { self.selectedTabIds.contains($0) } : [id]
+                    return self.delegate?.sidebarMenu(for: ids)
                 }
                 tabCellViews[tab.id] = cell
             }
             cell.update(tab: tab, isSelected: delegate?.currentTabId == tab.id)
             tabListView.addSubview(cell)
         }
+
+        // rows still in flight from a drop (or about to fly in from a menu) stay hidden until they land
+        for id in (drag?.ids ?? []) + Array(incomingIds) { tabCellViews[id]?.alphaValue = 0 }
 
         // Drop any selected ids for tabs that no longer exist, then refresh highlights.
         selectedTabIds.formIntersection(currentTabIds)
@@ -1243,6 +1686,100 @@ class TabListDropView: FlippedView {
         // Original: .onTapGesture { isUrlFieldFocused = false }
         onTapped?()
         super.mouseDown(with: event)
+    }
+}
+
+// MARK: - Sidebar Button
+
+// the sidebar's icon buttons light up under the pointer the way tabs do, and a press ripples out from
+// where it landed
+final class SidebarButton: NSButton {
+    private var isHovered = false
+    private var trackingArea: NSTrackingArea?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isEnabled: Bool {
+        didSet { updateHighlight(animated: false) }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        updateHighlight(animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        updateHighlight(animated: true)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if isEnabled { ripple(from: convert(event.locationInWindow, from: nil)) }
+        super.mouseDown(with: event)
+        // the press can end with the pointer elsewhere
+        isHovered = pointerInside(self)
+        updateHighlight(animated: true)
+    }
+
+    // the same highlight a hovered tab has
+    private func updateHighlight(animated: Bool) {
+        let color = isHovered && isEnabled ? NSColor.labelColor.withAlphaComponent(0.05).cgColor : NSColor.clear.cgColor
+        guard animated else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.backgroundColor = color
+            CATransaction.commit()
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            context.allowsImplicitAnimation = true
+            layer?.backgroundColor = color
+        }
+    }
+
+    // a soft circle that grows from the press until it covers the button, fading as it goes
+    private func ripple(from point: NSPoint) {
+        guard let layer else { return }
+        let reach = [NSPoint(x: 0, y: 0), NSPoint(x: bounds.maxX, y: 0), NSPoint(x: 0, y: bounds.maxY), NSPoint(x: bounds.maxX, y: bounds.maxY)]
+            .map { hypot($0.x - point.x, $0.y - point.y) }.max() ?? bounds.width
+        let circle = CAShapeLayer()
+        circle.frame = bounds
+        circle.path = CGPath(ellipseIn: NSRect(x: point.x - reach, y: point.y - reach, width: reach * 2, height: reach * 2), transform: nil)
+        circle.fillColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
+        circle.opacity = 0
+        layer.addSublayer(circle)
+
+        let grow = CABasicAnimation(keyPath: "path")
+        grow.fromValue = CGPath(ellipseIn: NSRect(x: point.x, y: point.y, width: 0, height: 0), transform: nil)
+        grow.toValue = circle.path
+        grow.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.3, 1)
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [1, 1, 0]
+        fade.keyTimes = [0, 0.4, 1]
+        let group = CAAnimationGroup()
+        group.animations = [grow, fade]
+        group.duration = 0.45
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { circle.removeFromSuperlayer() }
+        circle.add(group, forKey: "ripple")
+        CATransaction.commit()
     }
 }
 

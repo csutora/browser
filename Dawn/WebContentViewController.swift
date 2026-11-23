@@ -124,41 +124,56 @@ class WebContentViewController: NSViewController {
 
     // MARK: - Web View Management
 
-    func syncWebViews(browserStates: [UUID: BrowserState], tabs: [Tab], currentTabId: UUID?) {
-        // Register new web views without attaching them; they get attached on activation.
-        for (id, state) in browserStates {
-            if addedWebViews[id] == nil {
-                let wv = state.webView
-                wv.autoresizingMask = []
-                wv.frame = webViewContainer.bounds
-                addedWebViews[id] = wv
-                state.loadInitialContentIfNeeded()
-            }
-        }
-
-        // Remove stale web views
-        let staleIds = Set(addedWebViews.keys).subtracting(browserStates.keys)
-        for id in staleIds {
-            addedWebViews[id]?.removeFromSuperview()
-            addedWebViews.removeValue(forKey: id)
-            if activeTabId == id { activeTabId = nil }
-            if warmTabId == id { warmTabId = nil }
-        }
-
-        switchToTab(currentTabId, browserStates: browserStates, tabs: tabs)
+    // web views this window holds but whose pages are gone (unloaded or closed), or that another window
+    // took (a favorite's page is one page, shown in one window at a time)
+    func forgetWebViews(except live: Set<UUID>) {
+        for id in Set(addedWebViews.keys).subtracting(live) { forget(id) }
     }
 
-    func switchToTab(_ currentTabId: UUID?, browserStates: [UUID: BrowserState], tabs: [Tab]) {
-        let isSettingsTab = tabs.first(where: { $0.id == currentTabId })?.isSettings ?? false
+    private func forget(_ id: UUID) {
+        if let wv = addedWebViews.removeValue(forKey: id), wv.superview === webViewContainer { wv.removeFromSuperview() }
+        if activeTabId == id { activeTabId = nil }
+        if warmTabId == id { warmTabId = nil }
+    }
 
-        if isSettingsTab {
+    func isShowing(_ id: UUID) -> Bool {
+        activeTabId == id && addedWebViews[id]?.superview === webViewContainer
+    }
+
+    // another window is taking a page this one shows: a still of it stays in its place until this
+    // window shows something else, or takes the page back
+    private var cover: NSView?
+    private var coveredTabId: UUID?
+
+    func relinquish(_ id: UUID, still: NSImage?) {
+        let wasShowing = isShowing(id)
+        forget(id)
+        guard wasShowing, let image = still?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        removeCover()
+        let view = NSView(frame: webViewContainer.bounds)
+        view.wantsLayer = true
+        view.layer?.contents = image
+        view.layer?.contentsGravity = .topLeft
+        view.layer?.contentsScale = view.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        view.autoresizingMask = [.width, .height]
+        webViewContainer.addSubview(view)
+        cover = view
+        coveredTabId = id
+    }
+
+    private func removeCover() {
+        cover?.removeFromSuperview()
+        cover = nil
+        coveredTabId = nil
+    }
+
+    func show(_ currentTabId: UUID?, state: BrowserState?, settingsPath: String?) {
+        if let settingsPath {
+            removeCover()
             ensureSettingsView()
             settingsContainer?.isHidden = false
-            if let tab = tabs.first(where: { $0.id == currentTabId }) {
-                let path = extractSettingsPath(from: tab.url)
-                if settingsVC?.navigationState.currentPath != path {
-                    settingsVC?.navigationState.currentPath = path
-                }
+            if settingsVC?.navigationState.currentPath != settingsPath {
+                settingsVC?.navigationState.currentPath = settingsPath
             }
             // Keep the current web tab warm (attached, hidden) so returning to it is instant.
             if let wv = activeWebView {
@@ -175,11 +190,22 @@ class WebContentViewController: NSViewController {
 
         settingsContainer?.isHidden = true
 
-        if let id = currentTabId, let target = addedWebViews[id] {
-            activate(id: id, target: target)
+        // a page shown here for the first time is taken in (and starts loading, if it hasn't)
+        if let id = currentTabId, let state, addedWebViews[id] == nil {
+            let wv = state.webView
+            wv.autoresizingMask = []
+            wv.frame = webViewContainer.bounds
+            addedWebViews[id] = wv
+            state.loadInitialContentIfNeeded()
         }
 
-        if let id = currentTabId, let state = browserStates[id], let color = state.fetchedBackgroundColor {
+        if let id = currentTabId, let target = addedWebViews[id] {
+            activate(id: id, target: target)
+        } else if coveredTabId != currentTabId {
+            removeCover()
+        }
+
+        if let color = state?.fetchedBackgroundColor {
             backgroundColorView.layer?.backgroundColor = color.cgColor
         } else {
             backgroundColorView.layer?.backgroundColor = defaultColor.cgColor
@@ -188,9 +214,8 @@ class WebContentViewController: NSViewController {
 
     private func activate(id: UUID, target: WKWebView) {
         let oldActive = activeTabId
-        if id == oldActive {
+        if id == oldActive, target.superview === webViewContainer {
             target.isHidden = false
-            if target.superview == nil { webViewContainer.addSubview(target) }
             if !drivingWebViewSizeExternally {
                 target.autoresizingMask = [.width, .height]
                 target.frame = webViewContainer.bounds
@@ -201,14 +226,15 @@ class WebContentViewController: NSViewController {
         let oldActiveWv = oldActive.flatMap { addedWebViews[$0] }
 
         let swapIn: () -> Void = { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.addedWebViews[id] === target else { return }
             target.isHidden = false
             target.autoresizingMask = [.width, .height]
             self.webViewContainer.addSubview(target) // bring to front
-            if let oldActiveWv, oldActiveWv !== target {
+            if let oldActiveWv, oldActiveWv !== target, oldActiveWv.superview === self.webViewContainer {
                 oldActiveWv.isHidden = true
                 oldActiveWv.autoresizingMask = []
             }
+            self.removeCover()
             self.activeTabId = id
             if oldActive != id { self.warmTabId = oldActive }
             self.trimDetachedTabs()
@@ -216,12 +242,14 @@ class WebContentViewController: NSViewController {
 
         // Instant when the target is already attached at the current size (the common A<->B toggle);
         // otherwise attach it behind the current tab, reflow it, and reveal only once it has painted.
-        let instant = target.superview != nil && target.frame.size == webViewContainer.bounds.size
+        let instant = target.superview === webViewContainer && target.frame.size == webViewContainer.bounds.size
         if instant {
             swapIn()
         } else {
-            if let oldActiveWv, oldActiveWv !== target {
+            if let oldActiveWv, oldActiveWv !== target, oldActiveWv.superview === webViewContainer {
                 webViewContainer.addSubview(target, positioned: .below, relativeTo: oldActiveWv)
+            } else if let cover {
+                webViewContainer.addSubview(target, positioned: .below, relativeTo: cover)
             } else {
                 webViewContainer.addSubview(target)
             }
@@ -235,7 +263,7 @@ class WebContentViewController: NSViewController {
     // Detach every web view that isn't the active or the warm (previous) tab.
     private func trimDetachedTabs() {
         let keep = Set([activeTabId, warmTabId].compactMap { $0 })
-        for (id, wv) in addedWebViews where !keep.contains(id) && wv.superview != nil {
+        for (id, wv) in addedWebViews where !keep.contains(id) && wv.superview === webViewContainer {
             wv.removeFromSuperview()
         }
     }
