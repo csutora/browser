@@ -28,6 +28,8 @@ struct Suggestion: Identifiable, Equatable {
     let type: SuggestionType
     let displayText: String
     let secondaryText: String?
+    // the site's icon, shown instead of the symbol when there is one
+    var iconKey: String? = nil
 
     var iconName: String {
         switch type {
@@ -41,7 +43,8 @@ struct Suggestion: Identifiable, Equatable {
     static func == (lhs: Suggestion, rhs: Suggestion) -> Bool {
         lhs.type == rhs.type &&
         lhs.displayText == rhs.displayText &&
-        lhs.secondaryText == rhs.secondaryText
+        lhs.secondaryText == rhs.secondaryText &&
+        lhs.iconKey == rhs.iconKey
     }
 }
 
@@ -380,7 +383,8 @@ class CommandPaletteState: ObservableObject {
                 Suggestion(
                     type: .recentTab(tab),
                     displayText: tab.title.isEmpty ? "New Tab" : tab.title,
-                    secondaryText: cleanURLForDisplay(tab.url)
+                    secondaryText: cleanURLForDisplay(tab.url),
+                    iconKey: tab.iconKey
                 )
             }
             return
@@ -412,7 +416,8 @@ class CommandPaletteState: ObservableObject {
                     newSuggestions.append(Suggestion(
                         type: .historyEntry(entry.title, entry.url),
                         displayText: entry.title.isEmpty ? cleanURLForDisplay(entry.url) : entry.title,
-                        secondaryText: cleanURLForDisplay(entry.url)
+                        secondaryText: cleanURLForDisplay(entry.url),
+                        iconKey: entry.iconKey
                     ))
                 }
             }
@@ -463,7 +468,8 @@ class CommandPaletteState: ObservableObject {
                 let suggestion = Suggestion(
                     type: .historyEntry(entry.title, entry.url),
                     displayText: entry.title.isEmpty ? cleanURLForDisplay(entry.url) : entry.title,
-                    secondaryText: cleanURLForDisplay(entry.url)
+                    secondaryText: cleanURLForDisplay(entry.url),
+                    iconKey: entry.iconKey
                 )
                 scoredSuggestions.append((suggestion, entry.frecencyScore))
             }

@@ -632,7 +632,8 @@ class MainWindowController: NSWindowController {
                     tabManager: tabManager,
                     historyManager: historyManager,
                     initialURL: initialURL,
-                    interactionState: tab.interactionState
+                    interactionState: tab.interactionState,
+                    iconKey: tab.iconKey
                 )
                 s.onNewTabRequested = { [weak self] url, switchToTab in
                     self?.createTab(url: url.absoluteString, switchTo: switchToTab)

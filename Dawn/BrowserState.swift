@@ -131,8 +131,11 @@ class BrowserState: NSObject, ObservableObject {
         set { navigationDelegate.onNewWindowRequested = newValue }
     }
 
-    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
+    init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil,
+         iconKey: String? = nil, showsIcon: Bool = true) {
         self.navigationDelegate = NavigationDelegate()
+        self.iconKey = iconKey
+        self.showsIcon = showsIcon
 
         self.webView = DawnWebView(frame: .zero, configuration: Self.makeConfiguration())
 
@@ -151,8 +154,85 @@ class BrowserState: NSObject, ObservableObject {
         self.webView.customUserAgent = DevelopSettings.userAgent.string
         self.webView.allowsBackForwardNavigationGestures = true
         navigationDelegate.onDropOpen = { [weak self] urls in self?.openDropped(urls) }
+        if showsIcon { iconBridge.attach(to: webView) }
 
         setupObservations()
+    }
+
+    // MARK: - Icon
+
+    // the page's icon, in the icon store. a new page keeps showing the old page's icon until its own is
+    // decoded and ready to draw, or it's clear the page has none, so a tab is never caught without one.
+    @Published private(set) var iconKey: String?
+    private let showsIcon: Bool
+    private lazy var iconBridge = IconLoadingBridge { [weak self] in self?.iconOffered() }
+    // which page the icon is being found for, counting each page that replaces the last
+    private var iconPage = 0
+    // the icon known to be this page's: one it loaded, or the one it was last seen with
+    private var pageIconKey: String?
+    private var pageIconDetail = -1
+    private var iconLoadsPending = 0
+    private var pageNavigation: WKNavigation?
+    private var pageFinished = false
+
+    private func iconPageCommitted(_ navigation: WKNavigation?) {
+        iconPage += 1
+        pageNavigation = navigation
+        iconLoadsPending = 0
+        pageFinished = false
+        pageIconDetail = -1
+        // a page seen before shows its icon at once (a page restored from the back-forward cache never
+        // loads icons at all); what it loads replaces that if it differs
+        pageIconKey = webView.url.flatMap { historyManager?.iconKey(for: $0.absoluteString) }
+        if IconStore.shared.favicon(for: pageIconKey) == nil { pageIconKey = nil }
+        if let pageIconKey { showIcon(pageIconKey) }
+    }
+
+    // webkit offers the page's icons before it reports the page finished
+    private func iconOffered() -> ((Data?) -> Void)? {
+        let page = iconPage
+        iconLoadsPending += 1
+        return { [weak self] data in
+            guard let data, !data.isEmpty else {
+                self?.iconLoadEnded(page, nil)
+                return
+            }
+            Task.detached(priority: .utility) {
+                let prepared = IconStore.prepare(data)
+                await MainActor.run { self?.iconLoadEnded(page, prepared) }
+            }
+        }
+    }
+
+    private func iconLoadEnded(_ page: Int, _ prepared: IconStore.Prepared?) {
+        guard page == iconPage else { return }
+        iconLoadsPending -= 1
+        // of several icons, the most detailed one is kept
+        if let prepared, prepared.favicon.detail > pageIconDetail {
+            pageIconDetail = prepared.favicon.detail
+            pageIconKey = IconStore.shared.store(prepared)
+            showIcon(pageIconKey)
+        }
+        iconSettled()
+    }
+
+    private func iconPageFinished(_ navigation: WKNavigation?) {
+        guard navigation === pageNavigation else { return }
+        pageFinished = true
+        iconSettled()
+    }
+
+    // once the page has loaded and so have all its icons, a page that turned out to have none shows so
+    private func iconSettled() {
+        guard pageFinished, iconLoadsPending == 0 else { return }
+        showIcon(pageIconKey)
+    }
+
+    private func showIcon(_ key: String?) {
+        if let url = webView.url { historyManager?.setIconKey(key, for: url.absoluteString) }
+        guard key != iconKey else { return }
+        iconKey = key
+        tabManager?.updateTabIcon(tabId, iconKey: key)
     }
 
     // the first dropped item replaces this tab's page, like safari; any others open in background tabs
@@ -185,6 +265,10 @@ class BrowserState: NSObject, ObservableObject {
         navigationDelegate.onProvisionalEnd = { [weak self] in
             self?.hasProvisionalNavigation = false
             self?.publishCurrentURL()
+        }
+        if showsIcon {
+            navigationDelegate.onCommit = { [weak self] navigation in self?.iconPageCommitted(navigation) }
+            navigationDelegate.onFinish = { [weak self] navigation in self?.iconPageFinished(navigation) }
         }
 
         urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, _ in
@@ -230,7 +314,7 @@ class BrowserState: NSObject, ObservableObject {
            !url.absoluteString.hasPrefix("dawn://"),
            url.absoluteString != lastRecordedURL {
             lastRecordedURL = url.absoluteString
-            historyManager?.recordVisit(title: newTitle, url: url.absoluteString)
+            historyManager?.recordVisit(title: newTitle, url: url.absoluteString, iconKey: pageIconKey)
         }
     }
 

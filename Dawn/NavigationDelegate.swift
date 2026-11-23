@@ -14,6 +14,9 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     // and is abandoned when it fails (which is also how a navigation that became a download ends)
     var onProvisionalStart: (() -> Void)?
     var onProvisionalEnd: (() -> Void)?
+    // a new page replaced the old one, and later finished loading (or stopped short of it)
+    var onCommit: ((WKNavigation?) -> Void)?
+    var onFinish: ((WKNavigation?) -> Void)?
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         onProvisionalStart?()
@@ -21,6 +24,15 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         onProvisionalEnd?()
+        onCommit?(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        onFinish?(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        onFinish?(navigation)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {

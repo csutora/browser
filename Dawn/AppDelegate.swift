@@ -33,6 +33,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Multi-window: ensure a window exists and adopts any legacy window-less tabs.
         tabManager.ensureDefaultWindow()
 
+        IconStore.shared.referencedKeys = { [unowned self] in
+            self.tabManager.iconKeys().union(self.historyManager.iconKeys())
+        }
+        IconStore.shared.collectGarbage()
+
         windowManager = WindowManager(
             tabManager: tabManager,
             historyManager: historyManager,
@@ -48,7 +53,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         windowManager.restoreWindows()
         TerminalServer.shared.start { [unowned self] in
-            BrowserState(tabId: UUID(), tabManager: self.tabManager, historyManager: self.historyManager, initialURL: nil)
+            BrowserState(tabId: UUID(), tabManager: self.tabManager, historyManager: self.historyManager, initialURL: nil, showsIcon: false)
         }
         setupMainMenu()
         didFinishLaunching = true

@@ -390,8 +390,10 @@ private class SuggestionRowView: NSView {
         layer?.cornerRadius = 6
         layer?.cornerCurve = .continuous
 
-        // Icon - size 14, frame width 20
-        iconView.image = NSImage(systemSymbolName: suggestion.iconName, accessibilityDescription: nil)?
+        // Icon - size 14, frame width 20; a site's own icon at the sidebar's size, unscaled in that frame
+        iconView.imageScaling = .scaleNone
+        iconView.image = IconStore.shared.favicon(for: suggestion.iconKey)?.image(size: 16)
+            ?? NSImage(systemSymbolName: suggestion.iconName, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
         iconView.contentTintColor = .secondaryLabelColor
         addSubview(iconView)

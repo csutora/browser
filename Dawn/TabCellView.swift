@@ -22,6 +22,8 @@ class TabCellView: NSView {
     var onDragEnded: ((TabCellView, NSEvent) -> Void)?
 
     private let iconView: NSImageView
+    // the site icon the icon view shows, if it shows one
+    private var shownIconKey: String?
     private let titleLabel: NSTextField
     private let closeButton: NSButton
     private var trackingArea: NSTrackingArea?
@@ -95,15 +97,26 @@ class TabCellView: NSView {
         titleLabel.stringValue = tab.title.isEmpty ? "Untitled" : tab.title
 
         if tab.isSettings {
+            shownIconKey = nil
             iconView.image = NSImage(systemSymbolName: "gearshape.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
             iconView.contentTintColor = .secondaryLabelColor
             iconView.wantsLayer = true
             iconView.layer?.backgroundColor = nil
             iconView.layer?.cornerRadius = 0
+        } else if let favicon = IconStore.shared.favicon(for: tab.iconKey) {
+            // set only when it changes, so an update with the same icon doesn't redraw it
+            if shownIconKey != favicon.key {
+                iconView.image = favicon.image(size: 16)
+                shownIconKey = favicon.key
+            }
+            iconView.contentTintColor = nil
+            iconView.layer?.backgroundColor = nil
+            iconView.layer?.cornerRadius = 0
         } else {
             // Circle().fill(Color.secondary.opacity(0.2))
             iconView.image = nil
+            shownIconKey = nil
             iconView.wantsLayer = true
             iconView.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.2).cgColor
             iconView.layer?.cornerRadius = 8 // 8 on 16x16 = circle
@@ -153,7 +166,10 @@ class TabCellView: NSView {
         let titleX: CGFloat = 32 // 8 + 16 + 8
         // The title always runs full width; the fade (below), not the frame, accounts for the X.
         let titleW = max(0, bounds.width - titleX - 8)
-        titleLabel.frame = NSRect(x: titleX, y: (h - 18) / 2, width: titleW, height: 18)
+        // a label draws its line at the top of its frame, so the frame is exactly the line's height for the
+        // line to sit centered, on whole pixels
+        let titleH = titleLabel.cell?.cellSize.height ?? titleLabel.intrinsicContentSize.height
+        titleLabel.frame = backingAlignedRect(NSRect(x: titleX, y: (h - titleH) / 2, width: titleW, height: titleH), options: .alignAllEdgesNearest)
         updateTitleFade(titleW: titleW)
     }
 

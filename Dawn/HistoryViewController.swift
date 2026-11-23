@@ -391,7 +391,9 @@ class HistoryViewController: NSViewController, NSTableViewDataSource, NSTableVie
     private func makeWebsiteCell(_ entry: HistoryEntry) -> NSView {
         let cell = NSView()
         let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)?
+        icon.imageScaling = .scaleNone
+        icon.image = IconStore.shared.favicon(for: entry.iconKey)?.image(size: 16)
+            ?? NSImage(systemSymbolName: "globe", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
         icon.contentTintColor = .secondaryLabelColor
         icon.frame = NSRect(x: 12, y: 9, width: 18, height: 18)

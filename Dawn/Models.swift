@@ -22,6 +22,8 @@ final class Tab: Identifiable {
     var scrollY: Double = 0.0
     var zoomScale: Double = 1.0
     var backgroundColorHex: String?
+    // the page's icon in the icon store; nil shows the placeholder
+    var iconKey: String?
     var lastAccessedAt: Date = Date()
     // The window this tab belongs to. Inverse of WindowModel.tabs; nil only for legacy tabs before
     // the multi-window migration adopts them. sortIndex orders tabs within their window.
@@ -99,6 +101,7 @@ struct ClosedTabInfo: Codable {
     let sortIndex: Int
     let tabType: TabType
     let backgroundColorHex: String?
+    let iconKey: String?
     let interactionState: Data?
 }
 
@@ -181,7 +184,7 @@ class TabManager: ObservableObject {
             var stack = closedTabsByWindow[window.id] ?? []
             stack.append(ClosedTabInfo(
                 title: tab.title, url: tab.url, sortIndex: tab.sortIndex,
-                tabType: tab.tabType, backgroundColorHex: tab.backgroundColorHex,
+                tabType: tab.tabType, backgroundColorHex: tab.backgroundColorHex, iconKey: tab.iconKey,
                 interactionState: interactionState
             ))
             if stack.count > maxClosedTabs { stack.removeFirst() }
@@ -208,6 +211,7 @@ class TabManager: ObservableObject {
         for existing in ordered where existing.sortIndex >= insertAt { existing.sortIndex += 1 }
         let t = Tab(title: info.title, url: info.url, sortIndex: insertAt, tabType: info.tabType)
         t.backgroundColorHex = info.backgroundColorHex
+        t.iconKey = info.iconKey
         t.interactionState = info.interactionState
         context.insert(t)
         t.window = window
@@ -258,6 +262,22 @@ class TabManager: ObservableObject {
             scheduleSave()
         }
         NotificationCenter.default.post(name: .tabDataDidChange, object: id)
+    }
+
+    func tab(_ id: UUID) -> Tab? {
+        try? modelContext?.fetch(FetchDescriptor<Tab>(predicate: #Predicate { $0.id == id })).first
+    }
+
+    func updateTabIcon(_ id: UUID, iconKey: String?) {
+        guard let tab = tab(id), tab.iconKey != iconKey else { return }
+        tab.iconKey = iconKey
+        scheduleSave()
+        NotificationCenter.default.post(name: .tabDataDidChange, object: id)
+    }
+
+    // the icons of every tab, open or recently closed
+    func iconKeys() -> Set<String> {
+        Set(fetchTabs().compactMap(\.iconKey) + closedTabsByWindow.values.joined().compactMap(\.iconKey))
     }
 }
 

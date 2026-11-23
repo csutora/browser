@@ -10,6 +10,8 @@ final class HistoryEntry: Identifiable {
     var url: String
     var visitedAt: Date
     var visitCount: Int
+    // the page's icon in the icon store
+    var iconKey: String?
 
     /// Frecency score: balances frequency (visit count) with recency
     /// Higher scores for frequently visited and recently visited pages
@@ -33,32 +35,51 @@ final class HistoryEntry: Identifiable {
 class HistoryManager: ObservableObject {
     var modelContext: ModelContext?
 
+    // Normalize URL (remove trailing slash for consistency)
+    private static func normalized(_ url: String) -> String {
+        url.hasSuffix("/") && url.count > 1 ? String(url.dropLast()) : url
+    }
+
+    private func entry(for url: String) -> HistoryEntry? {
+        let normalizedURL = Self.normalized(url)
+        return try? modelContext?.fetch(FetchDescriptor<HistoryEntry>(predicate: #Predicate { $0.url == normalizedURL })).first
+    }
+
     /// Records a page visit, updating existing entry or creating new one
-    func recordVisit(title: String, url: String) {
+    func recordVisit(title: String, url: String, iconKey: String?) {
         guard let context = modelContext else { return }
 
-        // Normalize URL (remove trailing slash for consistency)
-        let normalizedURL = url.hasSuffix("/") && url.count > 1
-            ? String(url.dropLast())
-            : url
-
-        // Check if URL already exists
-        let descriptor = FetchDescriptor<HistoryEntry>(
-            predicate: #Predicate { $0.url == normalizedURL }
-        )
-
-        if let existing = try? context.fetch(descriptor).first {
+        if let existing = entry(for: url) {
             existing.visitCount += 1
             existing.visitedAt = Date()
             if !title.isEmpty && title != existing.title {
                 existing.title = title
             }
+            if let iconKey { existing.iconKey = iconKey }
         } else {
-            let entry = HistoryEntry(title: title, url: normalizedURL)
+            let entry = HistoryEntry(title: title, url: Self.normalized(url))
+            entry.iconKey = iconKey
             context.insert(entry)
         }
 
         try? context.save()
+    }
+
+    // the icon a page was last seen with
+    func iconKey(for url: String) -> String? {
+        entry(for: url)?.iconKey
+    }
+
+    func setIconKey(_ iconKey: String?, for url: String) {
+        guard let entry = entry(for: url), entry.iconKey != iconKey else { return }
+        entry.iconKey = iconKey
+        try? modelContext?.save()
+    }
+
+    func iconKeys() -> Set<String> {
+        var descriptor = FetchDescriptor<HistoryEntry>(predicate: #Predicate { $0.iconKey != nil })
+        descriptor.propertiesToFetch = [\.iconKey]
+        return Set(((try? modelContext?.fetch(descriptor)) ?? []).compactMap(\.iconKey))
     }
 
     /// Searches history by title or URL, returning results sorted by relevance
@@ -139,6 +160,7 @@ class HistoryManager: ObservableObject {
             context.delete(entry)
         }
         try? context.save()
+        IconStore.shared.collectGarbage()
     }
 
     /// Deletes entries by their IDs
@@ -152,6 +174,7 @@ class HistoryManager: ObservableObject {
             context.delete(entry)
         }
         try? context.save()
+        IconStore.shared.collectGarbage()
     }
 
     /// Deletes all history entries within a date range
@@ -170,6 +193,7 @@ class HistoryManager: ObservableObject {
             context.delete(entry)
         }
         try? context.save()
+        IconStore.shared.collectGarbage()
     }
 
     /// Clears all browsing history
@@ -183,5 +207,6 @@ class HistoryManager: ObservableObject {
             context.delete(entry)
         }
         try? context.save()
+        IconStore.shared.collectGarbage()
     }
 }
