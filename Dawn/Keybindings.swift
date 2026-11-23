@@ -161,6 +161,8 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
     case zoomIn = "zoom_in"
     case zoomOut = "zoom_out"
     case resetZoom = "reset_zoom"
+    case showDownloads = "show_downloads"
+    case showWebInspector = "show_web_inspector"
 
     var id: String { rawValue }
 
@@ -181,6 +183,8 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
         case .zoomIn: return "Zoom In"
         case .zoomOut: return "Zoom Out"
         case .resetZoom: return "Reset Zoom"
+        case .showDownloads: return "Show Downloads"
+        case .showWebInspector: return "Show Web Inspector"
         }
     }
 
@@ -222,6 +226,10 @@ enum KeybindAction: String, CaseIterable, Codable, Identifiable {
             return [KeyCombo(keyCode: 0x1B, char: "-", command: true)]
         case .resetZoom:
             return [KeyCombo(keyCode: 0x1D, char: "0", command: true)]
+        case .showDownloads:
+            return [KeyCombo(keyCode: 0x25, char: "l", command: true, option: true)]
+        case .showWebInspector:
+            return [KeyCombo(keyCode: 0x22, char: "i", command: true, option: true)]
         }
     }
 }

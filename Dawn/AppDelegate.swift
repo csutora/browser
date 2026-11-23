@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let tabManager = TabManager()
     let historyManager = HistoryManager()
     private var didFinishLaunching = false
+    private var developMenu: DevelopMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [
@@ -18,7 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         do {
-            modelContainer = try ModelContainer(for: Tab.self, WindowModel.self, HistoryEntry.self)
+            // swiftdata would otherwise keep its store in the app group's container, since dawn has one
+            // (for the terminal's frames); the store lives in dawn's own container
+            let configuration = ModelConfiguration(groupContainer: .none)
+            modelContainer = try ModelContainer(for: Tab.self, WindowModel.self, HistoryEntry.self, configurations: configuration)
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
         }
@@ -40,8 +44,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.windowManager.keyController?.handleKeybindAction(action)
         }
         KeybindHandler.shared.start()
+        DownloadClickTracker.shared.start()
 
         windowManager.restoreWindows()
+        TerminalServer.shared.start { [unowned self] in
+            BrowserState(tabId: UUID(), tabManager: self.tabManager, historyManager: self.historyManager, initialURL: nil)
+        }
         setupMainMenu()
         didFinishLaunching = true
     }
@@ -67,7 +75,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager?.stopGlobalHoverMonitor()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let active = DownloadManager.shared.activeItems.count
+        guard active > 0 else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = active == 1 ? "A download is in progress" : "\(active) downloads are in progress"
+        alert.informativeText = "Quitting will stop \(active == 1 ? "it" : "them")."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        DownloadManager.shared.discardPartialFiles()
         // Persist interaction state for every open tab across all windows.
         let tabs = tabManager.fetchTabs()
         for c in windowManager.controllers {
@@ -134,6 +154,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(withTitle: "Zoom In", action: #selector(zoomIn), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Zoom Out", action: #selector(zoomOut), keyEquivalent: "")
         mainMenu.addItem(viewMenuItem)
+
+        // Develop menu
+        let develop = DevelopMenu(
+            currentState: { [weak self] in self?.windowManager?.keyController?.currentBrowserState },
+            allStates: { [weak self] in
+                self?.windowManager?.controllers.flatMap { Array($0.browserStates.values) } ?? []
+            }
+        )
+        developMenu = develop
+        mainMenu.addItem(develop.makeMenuItem())
 
         // Window menu
         let windowMenu = NSMenu(title: "Window")
@@ -290,11 +320,13 @@ final class WindowManager {
     }
 
     @discardableResult
-    func newWindow() -> MainWindowController {
+    func newWindow(url: String? = nil) -> MainWindowController {
         let orderIndex = (windowModels().map(\.orderIndex).max() ?? -1) + 1
         let wm = WindowModel(orderIndex: orderIndex)
         modelContext.insert(wm)
-        _ = tabManager.createTab(in: wm, switchTo: true)
+        if let url {
+            _ = tabManager.createTab(in: wm, url: url, switchTo: true)
+        }
         try? modelContext.save()
 
         let previousKeyWindow = keyController?.window
@@ -454,6 +486,9 @@ final class WindowManager {
             guard let state = src.browserStates.removeValue(forKey: id) else { continue }
             state.onNewTabRequested = { [weak dst] url, switchTo in
                 dst?.createTab(url: url.absoluteString, switchTo: switchTo)
+            }
+            state.onNewWindowRequested = { [weak dst] url in
+                dst?.windowManager?.newWindow(url: url.absoluteString)
             }
             dst.browserStates[id] = state
         }

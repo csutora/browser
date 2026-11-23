@@ -8,6 +8,46 @@ import Combine
 final class DawnWebView: WKWebView {
     private var pointerOverPage = false
 
+    // what was dropped on the page, held while webkit decides whether the page takes it. if webkit
+    // instead loads the drop itself, the navigation delegate claims it and dawn opens it, so dropped
+    // files get a lasting grant and every dropped file opens, not only the first.
+    private var pendingDrop: [URL] = []
+    private var pendingDropExpiry: DispatchWorkItem?
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        pendingDrop = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] ?? []
+        pendingDropExpiry?.cancel()
+        return super.performDragOperation(sender)
+    }
+
+    func claimDrop(loading url: URL) -> [URL]? {
+        func same(_ a: URL, _ b: URL) -> Bool {
+            guard a.isFileURL, b.isFileURL else { return a == b }
+            return a.resolvingSymlinksInPath().path == b.resolvingSymlinksInPath().path
+        }
+        guard pendingDrop.contains(where: { same($0, url) }) else { return nil }
+        return takeDrop()
+    }
+
+    // webkit reports the drop as handled both when the page took it and when it loads it itself, and
+    // that load's policy check can arrive after the report, so a handled drop is only let go of later
+    func dropFinished(handled: Bool) -> [URL]? {
+        guard !pendingDrop.isEmpty else { return nil }
+        if !handled { return takeDrop() }
+        let expiry = DispatchWorkItem { [weak self] in self?.pendingDrop = [] }
+        pendingDropExpiry = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: expiry)
+        return nil
+    }
+
+    private func takeDrop() -> [URL] {
+        defer {
+            pendingDrop = []
+            pendingDropExpiry?.cancel()
+        }
+        return pendingDrop
+    }
+
     override func mouseMoved(with event: NSEvent) {
         guard let window, let hit = window.contentView?.hitTest(event.locationInWindow) else {
             super.mouseMoved(with: event)
@@ -41,8 +81,6 @@ class BrowserState: NSObject, ObservableObject {
     private var lastStyledURL: URL?
     private var lastRecordedURL: String?
 
-    // Modern Safari User-Agent for website compatibility
-    private static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15"
 
     // Tabs share cookies/storage and web content processes for free: WKWebViewConfiguration defaults
     // websiteDataStore to the shared .default() store, and since macOS 12 WebKit pools/suspends
@@ -51,6 +89,11 @@ class BrowserState: NSObject, ObservableObject {
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.preferences.isElementFullscreenEnabled = true
+        // the in-app web inspector (inspect element, the shortcut) hangs off webkit's developer extras
+        // preference, separate from isInspectable, which only covers remote inspection from safari
+        if config.preferences.responds(to: NSSelectorFromString("_setDeveloperExtrasEnabled:")) {
+            config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        }
         return config
     }
 
@@ -83,6 +126,11 @@ class BrowserState: NSObject, ObservableObject {
         set { navigationDelegate.onNewTabRequested = newValue }
     }
 
+    var onNewWindowRequested: ((URL) -> Void)? {
+        get { navigationDelegate.onNewWindowRequested }
+        set { navigationDelegate.onNewWindowRequested = newValue }
+    }
+
     init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, interactionState: Data? = nil) {
         self.navigationDelegate = NavigationDelegate()
 
@@ -97,18 +145,51 @@ class BrowserState: NSObject, ObservableObject {
         super.init()
 
         self.webView.navigationDelegate = navigationDelegate
+        // web inspector access (also adds inspect element to the context menu); off by default for apps
+        self.webView.isInspectable = true
         self.webView.uiDelegate = navigationDelegate
-        self.webView.customUserAgent = Self.safariUserAgent
+        self.webView.customUserAgent = DevelopSettings.userAgent.string
         self.webView.allowsBackForwardNavigationGestures = true
+        navigationDelegate.onDropOpen = { [weak self] urls in self?.openDropped(urls) }
 
         setupObservations()
     }
 
+    // the first dropped item replaces this tab's page, like safari; any others open in background tabs
+    private func openDropped(_ urls: [URL]) {
+        let openable = urls.filter { url in
+            if url.isFileURL { return !url.hasDirectoryPath && (try? url.checkResourceIsReachable()) == true }
+            return ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+        }
+        guard let first = openable.first else { return }
+        openable.filter(\.isFileURL).forEach { FileAccessStore.shared.remember($0) }
+        loadURL(first.absoluteString)
+        openable.dropFirst().forEach { onNewTabRequested?($0, false) }
+    }
+
+    // webkit reports a provisional navigation's url right away, even one that turns into a download
+    // and never commits. publishing it would flash the file's url in the url bar and could persist it
+    // as the tab's url (re-downloading the file on the next launch), so it's held until the
+    // navigation commits or fails. same-document changes (pushState, fragments) have no provisional
+    // phase and publish immediately.
+    private var hasProvisionalNavigation = false
+
+    private func publishCurrentURL() {
+        guard let url = webView.url else { return }
+        if currentURL != url { currentURL = url }
+        handleURLChange(url)
+    }
+
     private func setupObservations() {
-        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, change in
-            guard let self = self, let url = change.newValue as? URL else { return }
-            self.currentURL = url
-            self.handleURLChange(url)
+        navigationDelegate.onProvisionalStart = { [weak self] in self?.hasProvisionalNavigation = true }
+        navigationDelegate.onProvisionalEnd = { [weak self] in
+            self?.hasProvisionalNavigation = false
+            self?.publishCurrentURL()
+        }
+
+        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, _ in
+            guard let self, !self.hasProvisionalNavigation else { return }
+            self.publishCurrentURL()
         }
 
         titleObservation = webView.observe(\.title, options: [.new]) { [weak self] _, change in
@@ -244,6 +325,9 @@ class BrowserState: NSObject, ObservableObject {
             urlString = "https://" + urlString
         }
         guard let url = URL(string: urlString) else { return }
+        // a navigation the user asked for shows its target immediately; if it fails or turns into a
+        // download, the provisional end puts the page's url back
+        currentURL = url
         if url.isFileURL {
             loadFile(url)
         } else {
@@ -273,6 +357,32 @@ class BrowserState: NSObject, ObservableObject {
 
     deinit {
         accessedFiles.forEach { $0.stopAccessingSecurityScopedResource() }
+    }
+
+    // webkit has no public calls for its inspector, only its context menu item. its inspector object is
+    // reached defensively: if a future webkit renames something, the action does nothing rather than crash.
+    private var inspector: NSObject? {
+        guard webView.responds(to: NSSelectorFromString("_inspector")) else { return nil }
+        return webView.value(forKey: "_inspector") as? NSObject
+    }
+
+    private func inspectorFlag(_ name: String) -> Bool {
+        guard let inspector, inspector.responds(to: NSSelectorFromString(name)) else { return false }
+        return inspector.value(forKey: name) as? Bool ?? false
+    }
+
+    var isWebInspectorVisible: Bool { inspectorFlag("isVisible") }
+    var isElementSelectionActive: Bool { inspectorFlag("isElementSelectionActive") }
+    var isTimelineRecording: Bool { inspectorFlag("isProfilingPage") }
+
+    func performInspectorAction(_ name: String) {
+        let selector = NSSelectorFromString(name)
+        guard let inspector, inspector.responds(to: selector) else { return }
+        inspector.perform(selector)
+    }
+
+    func toggleWebInspector() {
+        performInspectorAction(isWebInspectorVisible ? "close" : "show")
     }
 
     func goBack() {

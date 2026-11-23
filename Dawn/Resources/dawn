@@ -1,0 +1,26 @@
+#!/bin/sh
+# shows a page in this terminal: dawn <url>
+# dawn's app sandbox won't let it change terminal settings, so this switches the terminal into raw mode
+# around the app's binary and always puts the settings back, however the page ends. the app runs as the
+# terminal's foreground job, so the terminal shows it, not this script, as what's running.
+
+here=$(dirname "$(realpath "$0")")
+app="$here/../MacOS/Dawn"
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "dawn: needs a terminal" >&2
+    exit 1
+fi
+if [ $# -eq 0 ]; then
+    echo "usage: dawn <url>" >&2
+    exit 1
+fi
+
+saved=$(stty -g)
+trap 'stty "$saved"' EXIT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+stty raw -echo
+set -m
+"$app" "$@" &
+fg %1 >/dev/null

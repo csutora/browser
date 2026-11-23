@@ -5,30 +5,67 @@ import WebKit
 class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Callback when a new tab is requested. Bool indicates whether to switch focus.
     var onNewTabRequested: ((URL, Bool) -> Void)?
+    var onNewWindowRequested: ((URL) -> Void)?
+    var onDropOpen: (([URL]) -> Void)?
+    // a page shown in a terminal has nowhere to show a native menu, which would otherwise open on its own
+    var showsContextMenus = true
+
+    // main-frame navigation lifecycle: a provisional navigation's url is tentative until it commits,
+    // and is abandoned when it fails (which is also how a navigation that became a download ends)
+    var onProvisionalStart: (() -> Void)?
+    var onProvisionalEnd: (() -> Void)?
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        onProvisionalStart?()
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        onProvisionalEnd?()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        onProvisionalEnd?()
+    }
 
     // MARK: - WKNavigationDelegate
 
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    // the preferences variant lets each navigation pick up the develop menu's javascript setting; a web
+    // view's configuration is a copy once created, so this is the supported place to change it
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, preferences: WKWebpagePreferences, decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void) {
+        preferences.allowsContentJavaScript = !DevelopSettings.javaScriptDisabled
         guard let url = navigationAction.request.url else {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
             return
         }
 
-        // target="_blank" or window.open() — targetFrame is nil
+        if navigationAction.targetFrame?.isMainFrame == true, let dawn = webView as? DawnWebView,
+           let dropped = dawn.claimDrop(loading: url) {
+            decisionHandler(.cancel, preferences)
+            onDropOpen?(dropped)
+            return
+        }
+
+        // target="_blank" or window.open(): targetFrame is nil
         if navigationAction.targetFrame == nil {
             onNewTabRequested?(url, true)
-            decisionHandler(.cancel)
+            decisionHandler(.cancel, preferences)
+            return
+        }
+
+        // links with a download attribute (including blob: and data: ones)
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download, preferences)
             return
         }
 
         // Cmd+click on a link opens in new tab (background)
         if navigationAction.navigationType == .linkActivated && navigationAction.modifierFlags.contains(.command) {
             onNewTabRequested?(url, false)
-            decisionHandler(.cancel)
+            decisionHandler(.cancel, preferences)
             return
         }
 
-        decisionHandler(.allow)
+        decisionHandler(.allow, preferences)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
@@ -57,64 +94,54 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     // MARK: - Download Handling
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        download.delegate = DownloadHandler.shared
+        DownloadManager.shared.register(download, from: webView)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        download.delegate = DownloadHandler.shared
+        DownloadManager.shared.register(download, from: webView)
     }
 
     // MARK: - WKUIDelegate
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // Handle window.open() — open in new tab
+        // Handle window.open(): open in new tab
         if let url = navigationAction.request.url {
             onNewTabRequested?(url, true)
         }
         return nil
     }
-}
 
-// MARK: - Download Handler
-class DownloadHandler: NSObject, WKDownloadDelegate {
-    static let shared = DownloadHandler()
+    // MARK: - Drops
 
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
-        guard let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+    // ui delegate spi: whether the page (or webkit's own load) took a drop. if nothing did, dawn opens it.
+    @objc(_webView:didPerformDragOperation:)
+    func webView(_ webView: WKWebView, didPerformDragOperation handled: Bool) {
+        guard let dawn = webView as? DawnWebView, let dropped = dawn.dropFinished(handled: handled) else { return }
+        onDropOpen?(dropped)
+    }
+
+    // MARK: - Context Menus
+
+    // webkit's ui delegate spi for macos context menus: it hands over its proposed menu with a hit test
+    // of what was clicked, and shows whatever menu comes back. if a future webkit drops it, webkit's
+    // own menu simply shows instead.
+    @objc(_webView:getContextMenuFromProposedMenu:forElement:userInfo:completionHandler:)
+    func webView(_ webView: WKWebView, getContextMenuFromProposedMenu menu: NSMenu, forElement element: NSObject, userInfo: NSObject?, completionHandler: @escaping (NSMenu?) -> Void) {
+        guard showsContextMenus else {
             completionHandler(nil)
             return
         }
-
-        let destinationURL = uniqueURL(for: suggestedFilename, in: downloadsDir)
-        completionHandler(destinationURL)
+        let actions = ContextMenuActions(
+            webView: webView,
+            openInNewTab: { [weak self] url in self?.onNewTabRequested?(url, true) },
+            openInNewWindow: { [weak self] url in self?.onNewWindowRequested?(url) }
+        )
+        completionHandler(ContextMenuBuilder.menu(from: menu, element: element, actions: actions))
     }
 
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        // TODO: Wire up to download manager UI when implemented
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        // TODO: Wire up to download manager UI when implemented
-    }
-
-    private func uniqueURL(for filename: String, in directory: URL) -> URL {
-        let fileManager = FileManager.default
-        var url = directory.appendingPathComponent(filename)
-
-        if !fileManager.fileExists(atPath: url.path) {
-            return url
-        }
-
-        let name = (filename as NSString).deletingPathExtension
-        let ext = (filename as NSString).pathExtension
-
-        var counter = 1
-        while fileManager.fileExists(atPath: url.path) {
-            let newFilename = ext.isEmpty ? "\(name) (\(counter))" : "\(name) (\(counter)).\(ext)"
-            url = directory.appendingPathComponent(newFilename)
-            counter += 1
-        }
-
-        return url
+    // downloads started by webkit's own context menu items
+    @objc(_webView:contextMenuDidCreateDownload:)
+    func webView(_ webView: WKWebView, contextMenuDidCreateDownload download: WKDownload) {
+        DownloadManager.shared.register(download, from: webView)
     }
 }

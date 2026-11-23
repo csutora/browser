@@ -19,6 +19,10 @@ class MainWindowController: NSWindowController {
         return currentTab?.url ?? ""
     }
 
+    var currentBrowserState: BrowserState? {
+        currentTabId.flatMap { browserStates[$0] }
+    }
+
     var currentTab: Tab? {
         guard let id = currentTabId else { return nil }
         return tabs.first(where: { $0.id == id })
@@ -85,6 +89,7 @@ class MainWindowController: NSWindowController {
     private var sidebarVC: SidebarViewController!
     private var webContentVC: WebContentViewController!
     private var commandPalettePanel: CommandPalettePanel?
+    private let downloadsPanel = DownloadsPanel()
 
     // State
     private var isFullscreen = false
@@ -152,8 +157,10 @@ class MainWindowController: NSWindowController {
         let crossed = withinHeight && ((prev.x > triggerLine) != (cur.x > triggerLine))
         if crossed { hoverSidebarOpen = true }
 
+        // the downloads panel is wider than the sidebar and anchored to it, so it holds the sidebar
+        // open while it's showing
         let x = cur.x - frame.minX
-        if hoverSidebarOpen, !withinHeight || x < -150 || x >= CGFloat(sidebarWidth) + 30 {
+        if hoverSidebarOpen, !downloadsPanel.isShown, !withinHeight || x < -150 || x >= CGFloat(sidebarWidth) + 30 {
             hoverSidebarOpen = false
         }
     }
@@ -389,6 +396,16 @@ class MainWindowController: NSWindowController {
     // MARK: - Observers
 
     private func setupObservers() {
+        // synchronous on purpose: the flight registers with the indicator before the manager publishes
+        // the new download, so the button reacts to the badge landing rather than ahead of it
+        DownloadManager.shared.events
+            .sink { [weak self] event in
+                guard case .started(_, let source) = event, let self, let source,
+                      self.browserStates.values.contains(where: { $0.webView === source }) else { return }
+                self.launchDownloadFlight()
+            }
+            .store(in: &cancellables)
+
         // Per-tab data updates (title/url/bg) can come from any window's web view; only react to tabs
         // this window owns. Structural changes (create/close/reorder) are driven directly, no notif.
         NotificationCenter.default.addObserver(
@@ -454,6 +471,7 @@ class MainWindowController: NSWindowController {
         // Drive the URL bar from the current tab: live web-view URL, or the stored url for a settings
         // tab / before the web view exists.
         sidebarVC.updateURLBar(currentTabURL)
+        sidebarVC.setWindowHasTab(currentTab != nil)
 
         guard let currentId = currentTabId, let state = browserStates[currentId] else { return }
 
@@ -464,7 +482,10 @@ class MainWindowController: NSWindowController {
             }
             .store(in: &browserStateCancellables)
 
+        // @Published emits before the property is stored and updateNavState reads the properties, so
+        // hop a turn; otherwise a lone isLoading flip (a download ends its navigation) is rendered stale
         Publishers.CombineLatest3(state.$canGoBack, state.$canGoForward, state.$isLoading)
+            .receive(on: DispatchQueue.main)
             .sink { [weak self, weak state] _, _, _ in
                 guard let state = state else { return }
                 self?.sidebarVC.updateNavState(for: state)
@@ -600,10 +621,6 @@ class MainWindowController: NSWindowController {
 
     func loadTabs() {
         tabs = tabManager.orderedTabs(in: windowModel)
-        if tabs.isEmpty {
-            _ = tabManager.createTab(in: windowModel, switchTo: true)
-            tabs = tabManager.orderedTabs(in: windowModel)
-        }
     }
 
     func syncStates() {
@@ -619,6 +636,9 @@ class MainWindowController: NSWindowController {
                 )
                 s.onNewTabRequested = { [weak self] url, switchToTab in
                     self?.createTab(url: url.absoluteString, switchTo: switchToTab)
+                }
+                s.onNewWindowRequested = { [weak self] url in
+                    self?.windowManager?.newWindow(url: url.absoluteString)
                 }
                 browserStates[tab.id] = s
             }
@@ -674,6 +694,12 @@ class MainWindowController: NSWindowController {
 
         case .reopenClosedTab:
             reopenLastClosedTab()
+
+        case .showDownloads:
+            toggleDownloadsPanel()
+
+        case .showWebInspector:
+            browserStates[currentTabId ?? UUID()]?.toggleWebInspector()
 
         case .refresh:
             browserStates[currentTabId ?? UUID()]?.reload()
@@ -854,6 +880,46 @@ class MainWindowController: NSWindowController {
         )
     }
 
+    // MARK: - Downloads
+
+    private var isSidebarShown: Bool { isDocked || isFloatingVisible }
+
+    // the badge launches from the click that triggered the download, or from the middle of the page
+    // for keyboard-triggered ones, and lands on the sidebar's button (or a catcher tile when the
+    // floating sidebar is tucked away)
+    private func launchDownloadFlight() {
+        guard let rootView, let window else { return }
+        let start = DownloadClickTracker.shared.recentClick(in: window).map { rootView.convert($0, from: nil) }
+            ?? NSPoint(x: contentContainer.frame.midX, y: contentContainer.frame.midY)
+        guard isSidebarShown, let indicator = sidebarVC.downloadIndicator else {
+            DownloadFlight.launchToCatcher(in: rootView, from: start)
+            return
+        }
+        indicator.expectFlight()
+        let end = rootView.convert(indicator.landingPointInWindow, from: nil)
+        DownloadFlight.launch(in: rootView, from: start, to: end) { [weak indicator] in
+            indicator?.flightLanded()
+        }
+    }
+
+    func toggleDownloadsPanel() {
+        guard let rootView, let indicator = sidebarVC.downloadIndicator else { return }
+        let anchor: NSRect
+        let leadingX: CGFloat
+        if isSidebarShown {
+            anchor = indicator.convert(indicator.bounds, to: rootView)
+            leadingX = sidebarContainer.frame.minX + 8
+        } else {
+            anchor = NSRect(x: 14, y: 14, width: 26, height: 26)
+            leadingX = 8
+        }
+        downloadsPanel.toggleRectInWindow = { [weak indicator] in
+            guard let indicator, !indicator.isHidden else { return nil }
+            return indicator.convert(indicator.bounds, to: nil)
+        }
+        downloadsPanel.toggle(in: rootView, anchor: anchor, leadingX: leadingX)
+    }
+
     // MARK: - Command Palette
 
     func showCommandPalette() {
@@ -955,8 +1021,12 @@ extension MainWindowController: SidebarDelegate {
     func sidebarDidSubmitURL(_ url: String) {
         if url.lowercased().hasPrefix("dawn://") {
             openSettings()
+        } else if let state = currentTabId.flatMap({ browserStates[$0] }) {
+            state.loadURL(url)
         } else {
-            browserStates[currentTabId ?? UUID()]?.loadURL(url)
+            // a window without tabs gets one for what was typed
+            let tab = createTab(url: "about:blank", switchTo: true)
+            browserStates[tab.id]?.loadURL(url)
         }
     }
 
@@ -972,6 +1042,10 @@ extension MainWindowController: SidebarDelegate {
 
     func sidebarTabDragEnded() {
         windowManager?.tabDragEnded()
+    }
+
+    func sidebarDidRequestDownloads() {
+        toggleDownloadsPanel()
     }
 
     func sidebarDidReorderTabs(_ orderedTabIds: [UUID]) {

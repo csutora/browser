@@ -14,6 +14,7 @@ protocol SidebarDelegate: AnyObject {
     func sidebarDidRequestReload()
     func sidebarDidSubmitURL(_ url: String)
     func sidebarDidReorderTabs(_ orderedTabIds: [UUID])
+    func sidebarDidRequestDownloads()
     // Drop landed outside this window's list: commit the move and return the destination window's
     // sidebar to adopt the live pile (cross-window / tear-off), or nil to spring the pile home.
     func sidebarHandOffPile(_ ids: [UUID], at screenPoint: CGPoint) -> SidebarViewController?
@@ -46,6 +47,7 @@ class SidebarViewController: NSViewController {
     private var tabListView: TabListDropView!
     private var footerView: NSView!
     private var newTabButton: NSButton!
+    private(set) var downloadIndicator: DownloadIndicatorView!
 
     // State
     private var tabs: [Tab] = []
@@ -234,6 +236,10 @@ class SidebarViewController: NSViewController {
         newTabButton.target = self
         newTabButton.action = #selector(newTabClicked)
         footerView.addSubview(newTabButton)
+
+        downloadIndicator = DownloadIndicatorView(frame: .zero)
+        downloadIndicator.onClick = { [weak self] in self?.delegate?.sidebarDidRequestDownloads() }
+        footerView.addSubview(downloadIndicator)
 
         // Observe URL field focus changes for border color
         focusObserver = NotificationCenter.default.addObserver(
@@ -444,6 +450,17 @@ class SidebarViewController: NSViewController {
         footerView.frame = NSRect(x: 0, y: 0, width: w, height: footerH)
         newTabButton.frame = NSRect(x: footerInset, y: footerInset, width: newTabButton.frame.width, height: newTabH)
 
+        // the downloads button mirrors the "+" glyph into the bottom-right corner. the resting arrow is
+        // drawn at the plus's size, so mirroring the glyph's center gives equal visible insets
+        let hit: CGFloat = 26
+        var plusCenter = NSPoint(x: newTabButton.frame.minX + 6, y: newTabButton.frame.midY)
+        if let cell = newTabButton.cell {
+            let imageRect = newTabButton.convert(cell.imageRect(forBounds: newTabButton.bounds), to: footerView)
+            plusCenter = NSPoint(x: imageRect.midX, y: imageRect.midY)
+        }
+        let glyphCenter = NSPoint(x: w - plusCenter.x, y: plusCenter.y)
+        downloadIndicator.frame = NSRect(x: glyphCenter.x - hit / 2, y: glyphCenter.y - hit / 2, width: hit, height: hit)
+
         // Scroll view (between divider and footer)
         let scrollY = footerH
         let scrollH = max(0, dividerY - 1 - scrollY)
@@ -577,6 +594,11 @@ class SidebarViewController: NSViewController {
     func updateURLBar(_ url: String) {
         currentURLString = url
         refreshURLDisplay()
+    }
+
+    // an empty window has nothing to search from yet, so its bar just says whose it is
+    func setWindowHasTab(_ hasTab: Bool) {
+        urlBar.placeholderString = hasTab ? "Search" : "Dawn"
     }
 
     // The displayed string is CUT to what fits the bar (hard cut, hidden under the fade): text that
