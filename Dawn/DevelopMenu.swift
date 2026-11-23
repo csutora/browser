@@ -86,6 +86,8 @@ final class DevelopMenu: NSObject, NSMenuItemValidation {
         let agentItem = NSMenuItem(title: "User Agent", action: nil, keyEquivalent: "")
         agentItem.submenu = agents
         menu.addItem(agentItem)
+        menu.addItem(.separator())
+        add("Trace Terminal Rendering", #selector(toggleTerminalTrace))
 
         let item = NSMenuItem(title: "Develop", action: nil, keyEquivalent: "")
         item.submenu = menu
@@ -96,6 +98,9 @@ final class DevelopMenu: NSObject, NSMenuItemValidation {
         switch menuItem.action {
         case #selector(toggleJavaScript):
             menuItem.state = DevelopSettings.javaScriptDisabled ? .on : .off
+            return true
+        case #selector(toggleTerminalTrace):
+            menuItem.state = TerminalTrace.isEnabled ? .on : .off
             return true
         case #selector(chooseUserAgent(_:)):
             menuItem.state = (menuItem.representedObject as? String) == DevelopSettings.userAgent.rawValue ? .on : .off
@@ -135,6 +140,10 @@ final class DevelopMenu: NSObject, NSMenuItemValidation {
         DevelopSettings.javaScriptDisabled.toggle()
         // takes effect on the next navigation, so reload the page being looked at
         currentState()?.webView.reload()
+    }
+
+    @objc private func toggleTerminalTrace() {
+        TerminalTrace.isEnabled.toggle()
     }
 
     @objc private func chooseUserAgent(_ sender: NSMenuItem) {

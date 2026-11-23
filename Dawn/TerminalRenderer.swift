@@ -304,7 +304,7 @@ final class TerminalRenderer: NSObject {
             scene = scene.map { node in node.kind.isComposited ? before[node.key] ?? node : node }
         }
         let changed = !damage.isEmpty || scene.count != previous.count || zip(scene, previous).contains { !$0.sameGeometry(as: $1) }
-        if changed {
+        if changed, TerminalTrace.isEnabled {
             var kinds = (surfaces: 0, colors: 0, composited: 0, hosted: 0, waiting: 0, compositedArea: 0)
             for node in scene {
                 switch node.kind {
@@ -1090,13 +1090,35 @@ final class TerminalRenderer: NSObject {
     #endif
 }
 
-// a timestamped log of what the renderer does, for finding what makes it stutter
-nonisolated(unsafe) private var traceHandle: FileHandle? = {
-    let path = NSHomeDirectory() + "/tmp/trace.log"
-    FileManager.default.createFile(atPath: path, contents: nil)
-    return FileHandle(forWritingAtPath: path)
-}()
+// a timestamped log of what pages shown in a terminal do, for finding what makes them stutter. it's
+// written to the app's tmp/trace.log while the develop menu's toggle is on, starting afresh each time
+// it's switched on.
+enum TerminalTrace {
+    private static let key = "developTraceTerminalRendering"
+    private static var handle = open(UserDefaults.standard.bool(forKey: key))
 
-func trace(_ message: String) {
-    traceHandle?.write(Data(String(format: "%.4f %@\n", CACurrentMediaTime(), message).utf8))
+    static var isEnabled: Bool {
+        get { handle != nil }
+        set {
+            UserDefaults.standard.set(newValue, forKey: key)
+            try? handle?.close()
+            handle = open(newValue)
+        }
+    }
+
+    private static func open(_ enabled: Bool) -> FileHandle? {
+        guard enabled else { return nil }
+        let path = NSHomeDirectory() + "/tmp/trace.log"
+        FileManager.default.createFile(atPath: path, contents: nil)
+        return FileHandle(forWritingAtPath: path)
+    }
+
+    static func write(_ message: @autoclosure () -> String) {
+        guard let handle else { return }
+        handle.write(Data(String(format: "%.4f %@\n", CACurrentMediaTime(), message()).utf8))
+    }
+}
+
+func trace(_ message: @autoclosure () -> String) {
+    TerminalTrace.write(message())
 }
