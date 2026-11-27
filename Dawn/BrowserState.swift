@@ -8,6 +8,17 @@ import Combine
 final class DawnWebView: WKWebView {
     private var pointerOverPage = false
 
+    // while the page asks something, the question takes the keyboard and the pointer
+    weak var dialogView: PageDialogView?
+
+    override func becomeFirstResponder() -> Bool {
+        if let dialogView {
+            DispatchQueue.main.async { dialogView.takeFocus() }
+            return false
+        }
+        return super.becomeFirstResponder()
+    }
+
     // what was dropped on the page, held while webkit decides whether the page takes it. if webkit
     // instead loads the drop itself, the navigation delegate claims it and dawn opens it, so dropped
     // files get a lasting grant and every dropped file opens, not only the first.
@@ -53,7 +64,7 @@ final class DawnWebView: WKWebView {
             super.mouseMoved(with: event)
             return
         }
-        guard hit.isDescendant(of: self) else {
+        guard hit.isDescendant(of: self), !(dialogView.map { hit.isDescendant(of: $0) } ?? false) else {
             if pointerOverPage {
                 pointerOverPage = false
                 NSCursor.arrow.set()
@@ -161,13 +172,32 @@ class BrowserState: NSObject, ObservableObject {
         set { navigationDelegate.onNewWindowRequested = newValue }
     }
 
+    var onOpenPage: ((WKWebViewConfiguration, URL?, Bool) -> WKWebView?)? {
+        get { navigationDelegate.onOpenPage }
+        set { navigationDelegate.onOpenPage = newValue }
+    }
+
+    var onClose: (() -> Void)? {
+        get { navigationDelegate.onClose }
+        set { navigationDelegate.onClose = newValue }
+    }
+
+    // `opening` is the configuration webkit gave for a page another page opened, which webkit then
+    // loads into this one's web view itself
     init(tabId: UUID, tabManager: TabManager, historyManager: HistoryManager? = nil, initialURL: URL?, saved: SavedPage = SavedPage(),
-         iconKey: String? = nil, showsIcon: Bool = true) {
+         iconKey: String? = nil, showsIcon: Bool = true, opening: WKWebViewConfiguration? = nil) {
         self.navigationDelegate = NavigationDelegate()
         self.iconKey = iconKey
         self.showsIcon = showsIcon
 
-        self.webView = DawnWebView(frame: .zero, configuration: Self.makeConfiguration())
+        if let opening {
+            // the opener's configuration carries its content controller, whose handlers report to the opener
+            opening.userContentController = WKUserContentController()
+            self.webView = DawnWebView(frame: .zero, configuration: opening)
+            self.hasLoadedInitialContent = true
+        } else {
+            self.webView = DawnWebView(frame: .zero, configuration: Self.makeConfiguration())
+        }
 
         self.tabId = tabId
         self.tabManager = tabManager
@@ -190,6 +220,14 @@ class BrowserState: NSObject, ObservableObject {
         self.webView.customUserAgent = DevelopSettings.userAgent.string
         self.webView.allowsBackForwardNavigationGestures = true
         navigationDelegate.onDropOpen = { [weak self] urls in self?.openDropped(urls) }
+        navigationDelegate.onDialog = { [weak self] dialog in
+            guard let self else { return dialog.completion(false, []) }
+            self.present(dialog)
+        }
+        navigationDelegate.onAuthenticate = { [weak self] challenge, completion in
+            guard let self else { return completion(nil) }
+            self.authenticate(challenge, completion)
+        }
         if showsIcon { iconBridge.attach(to: webView) }
 
         setupObservations()
@@ -321,7 +359,7 @@ class BrowserState: NSObject, ObservableObject {
         }
         let capturingScreen = webView.responds(to: NSSelectorFromString("_displayCaptureState"))
             && (webView.value(forKey: "_displayCaptureState") as? Int ?? 0) != WKMediaCaptureState.none.rawValue
-        guard hasLoadedInitialContent, !hasUserInput, !isFormResult, !webView.isLoading, !isWebInspectorVisible,
+        guard hasLoadedInitialContent, !hasUserInput, !isFormResult, !webView.isLoading, !isWebInspectorVisible, currentDialog == nil,
               webView.fullscreenState == .notInFullscreen, webView.cameraCaptureState == .none,
               webView.microphoneCaptureState == .none, !capturingScreen, !privateFlag("_isPlayingAudio") else {
             return completion(false)
@@ -354,6 +392,63 @@ class BrowserState: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Dialogs
+
+    // one question at a time, in the order the page asked them
+    private var currentDialog: PageDialogView?
+    private var queuedDialogs: [PageDialog] = []
+    // requests waiting on a sign-in, by where they sign in to. several can ask at once for the same
+    // place; it's asked about once, and they all get the answer.
+    private var authWaiters: [String: [(URLCredential?) -> Void]] = [:]
+
+    func present(_ dialog: PageDialog) {
+        queuedDialogs.append(dialog)
+        showNextDialog()
+    }
+
+    private func showNextDialog() {
+        guard currentDialog == nil, !queuedDialogs.isEmpty else { return }
+        let view = PageDialogView(queuedDialogs.removeFirst()) { [weak self] in
+            self?.currentDialog = nil
+            self?.showNextDialog()
+        }
+        currentDialog = view
+        view.present(in: webView)
+    }
+
+    // the person moved the page on, leaving whatever it asked unanswered, as if cancelled
+    private func dismissDialogs() {
+        let queued = queuedDialogs
+        queuedDialogs = []
+        queued.forEach { $0.completion(false, []) }
+        currentDialog?.cancel()
+    }
+
+    private func authenticate(_ challenge: URLAuthenticationChallenge, _ completion: @escaping (URLCredential?) -> Void) {
+        let space = challenge.protectionSpace
+        let key = [space.protocol ?? "", space.host, String(space.port), space.realm ?? "", space.authenticationMethod, space.isProxy() ? "proxy" : ""]
+            .joined(separator: "\n")
+        if authWaiters[key] != nil { return authWaiters[key]!.append(completion) }
+        authWaiters[key] = [completion]
+
+        let defaultPort = space.protocol == "https" ? 443 : 80
+        let place = space.port == 0 || space.port == defaultPort ? space.host : "\(space.host):\(space.port)"
+        var notes: [String] = []
+        if challenge.previousFailureCount > 0 { notes.append("The username or password was incorrect.") }
+        if !space.receivesCredentialSecurely { notes.append("Your password will be sent unencrypted.") }
+        // the realm is left out: it's the site's own words, free to impersonate anyone
+        present(PageDialog(
+            title: space.isProxy() ? "Log in to the proxy \(place)" : "Log in to \(place)",
+            message: notes.joined(separator: " "),
+            fields: [.text(placeholder: "Username", value: challenge.proposedCredential?.user ?? "", contentType: .username), .secure(placeholder: "Password")],
+            confirmTitle: "Log In"
+        ) { [weak self] confirmed, values in
+            guard let self else { return }
+            let credential = confirmed ? URLCredential(user: values[0], password: values[1], persistence: .forSession) : nil
+            self.authWaiters.removeValue(forKey: key)?.forEach { $0(credential) }
+        })
     }
 
     // the first dropped item replaces this tab's page, like safari; any others open in background tabs
@@ -552,11 +647,8 @@ class BrowserState: NSObject, ObservableObject {
     }
 
     func loadURL(_ s: String) {
-        var urlString = s
-        if !urlString.contains("://") {
-            urlString = "https://" + urlString
-        }
-        guard let url = URL(string: urlString) else { return }
+        guard let url = URL(string: withDefaultScheme(s)) else { return }
+        dismissDialogs()
         // a navigation the user asked for shows its target immediately; if it fails or turns into a
         // download, the provisional end puts the page's url back
         currentURL = url
@@ -589,6 +681,11 @@ class BrowserState: NSObject, ObservableObject {
 
     deinit {
         accessedFiles.forEach { $0.stopAccessingSecurityScopedResource() }
+        // webkit needs every question answered, even for a page that's going away
+        let waiting = authWaiters.values.joined()
+        authWaiters = [:]
+        waiting.forEach { $0(nil) }
+        dismissDialogs()
     }
 
     // webkit has no public calls for its inspector, only its context menu item. its inspector object is
@@ -618,14 +715,17 @@ class BrowserState: NSObject, ObservableObject {
     }
 
     func goBack() {
+        dismissDialogs()
         webView.goBack()
     }
 
     func goForward() {
+        dismissDialogs()
         webView.goForward()
     }
 
     func reload() {
+        dismissDialogs()
         lastStyledURL = nil
         webView.reload()
     }

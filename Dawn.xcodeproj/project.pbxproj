@@ -257,7 +257,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				SWIFT_OBJC_BRIDGING_HEADER = "Dawn/Dawn-Bridging-Header.h";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 0.1.0;
+				CURRENT_PROJECT_VERSION = 0.1.1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = KKSNTMR4ML;
 				ENABLE_APP_SANDBOX = YES;
@@ -282,7 +282,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.csutora.Dawn;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -304,7 +304,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				SWIFT_OBJC_BRIDGING_HEADER = "Dawn/Dawn-Bridging-Header.h";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 0.1.0;
+				CURRENT_PROJECT_VERSION = 0.1.1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = KKSNTMR4ML;
 				ENABLE_APP_SANDBOX = YES;
@@ -329,7 +329,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.csutora.Dawn;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

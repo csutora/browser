@@ -269,6 +269,10 @@ final class WindowManager {
             controller.createTab(url: url.absoluteString, switchTo: switchTo)
         }
         favorites.openWindow = { [weak self] url in self?.newWindow(url: url.absoluteString) }
+        favorites.openPage = { [weak self] configuration, url, switchTo, host in
+            guard let self, let controller = host ?? self.keyController else { return nil }
+            return controller.openPage(configuration, url: url, switchTo: switchTo)
+        }
 
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged]
         hoverLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in

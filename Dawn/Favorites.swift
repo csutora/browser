@@ -14,6 +14,7 @@ final class FavoritesController {
     // where a favorite's new tabs and windows open: the window using it
     var openTab: ((URL, Bool, MainWindowController?) -> Void)?
     var openWindow: ((URL) -> Void)?
+    var openPage: ((WKWebViewConfiguration, URL?, Bool, MainWindowController?) -> WKWebView?)?
 
     private struct WeakController {
         weak var controller: MainWindowController?
@@ -65,6 +66,11 @@ final class FavoritesController {
             self?.openTab?(url, switchTo, self?.host(of: id))
         }
         state.onNewWindowRequested = { [weak self] url in self?.openWindow?(url) }
+        state.onOpenPage = { [weak self] configuration, url, switchTo in
+            self?.openPage?(configuration, url, switchTo, self?.host(of: id))
+        }
+        // a favorite stays, even when its page closes itself
+        state.onClose = nil
         states[id] = state
         if let host { hosts[id] = WeakController(controller: host) }
     }

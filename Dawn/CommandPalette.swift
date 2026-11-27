@@ -594,3 +594,24 @@ class CommandPaletteState: ObservableObject {
         return cleaned
     }
 }
+
+// MARK: - Default Scheme
+
+// an address typed without a scheme gets https, except one that only makes sense nearby (localhost,
+// an ip address, a .local name, a single-word host), which rarely serves https, as in chrome
+func withDefaultScheme(_ input: String) -> String {
+    guard !input.contains("://") else { return input }
+    return (isNearbyHost(input) ? "http://" : "https://") + input
+}
+
+private func isNearbyHost(_ input: String) -> Bool {
+    var host = Substring(input)
+    if let end = host.firstIndex(where: { "/?#".contains($0) }) { host = host[..<end] }
+    if let at = host.lastIndex(of: "@") { host = host[host.index(after: at)...] }
+    if host.hasPrefix("[") { return true }
+    if let colon = host.lastIndex(of: ":") { host = host[..<colon] }
+    let name = host.lowercased()
+    var address = in_addr()
+    return name == "localhost" || name.hasSuffix(".localhost") || name.hasSuffix(".local")
+        || !name.contains(".") || inet_pton(AF_INET, name, &address) == 1
+}

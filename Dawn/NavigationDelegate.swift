@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import WebKit
 
 // MARK: - Navigation Delegate (handles navigation policies, new tabs, downloads)
@@ -19,6 +20,15 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     var onMainFrameRequest: ((URLRequest) -> Void)?
     var onCommit: ((WKNavigation?) -> Void)?
     var onFinish: ((WKNavigation?) -> Void)?
+
+    // a page the page opens itself (window.open, a link to a new window) has to be shown in a web view
+    // made from webkit's configuration and returned to it, or it loses its tie to its opener: sign-in
+    // windows then can't report back. given the url and whether it should come to the front.
+    var onOpenPage: ((WKWebViewConfiguration, URL?, Bool) -> WKWebView?)?
+    // the page closed itself (only pages opened by script may)
+    var onClose: (() -> Void)?
+    var onDialog: ((PageDialog) -> Void)?
+    var onAuthenticate: ((URLAuthenticationChallenge, @escaping (URLCredential?) -> Void) -> Void)?
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         onProvisionalStart?()
@@ -59,21 +69,15 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             return
         }
 
-        // target="_blank" or window.open(): targetFrame is nil
-        if navigationAction.targetFrame == nil {
-            onNewTabRequested?(url, true)
-            decisionHandler(.cancel, preferences)
-            return
-        }
-
         // links with a download attribute (including blob: and data: ones)
         if navigationAction.shouldPerformDownload {
             decisionHandler(.download, preferences)
             return
         }
 
-        // Cmd+click on a link opens in new tab (background)
-        if navigationAction.navigationType == .linkActivated && navigationAction.modifierFlags.contains(.command) {
+        // Cmd+click on a link opens in new tab (background). links to a new window (target="_blank")
+        // go on to createWebViewWith, which opens them, cmd or not.
+        if navigationAction.targetFrame != nil, navigationAction.navigationType == .linkActivated && navigationAction.modifierFlags.contains(.command) {
             onNewTabRequested?(url, false)
             decisionHandler(.cancel, preferences)
             return
@@ -118,12 +122,80 @@ class NavigationDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     // MARK: - WKUIDelegate
 
+    // a new window the page opens becomes a tab, whatever size it asked for: dawn's windows are tabs
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // Handle window.open(): open in new tab
-        if let url = navigationAction.request.url {
-            onNewTabRequested?(url, true)
-        }
+        let url = navigationAction.request.url.flatMap { $0.absoluteString.isEmpty ? nil : $0 }
+        let foreground = !navigationAction.modifierFlags.contains(.command)
+        if let onOpenPage { return onOpenPage(configuration, url, foreground) }
+        if let url { onNewTabRequested?(url, foreground) }
         return nil
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        onClose?()
+    }
+
+    // MARK: - Dialogs
+
+    // who's asking: the frame's origin, which a page can't fake, rather than anything the page says
+    private static func asker(_ frame: WKFrameInfo) -> String {
+        let origin = frame.securityOrigin
+        guard !origin.host.isEmpty else { return "This page says" }
+        return (origin.port == 0 ? origin.host : "\(origin.host):\(origin.port)") + " says"
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        guard let onDialog else { return completionHandler() }
+        onDialog(PageDialog(title: Self.asker(frame), message: message, cancelTitle: nil) { _, _ in completionHandler() })
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        guard let onDialog else { return completionHandler(false) }
+        onDialog(PageDialog(title: Self.asker(frame), message: message) { confirmed, _ in completionHandler(confirmed) })
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+        guard let onDialog else { return completionHandler(nil) }
+        onDialog(PageDialog(title: Self.asker(frame), message: prompt, fields: [.text(placeholder: "", value: defaultText ?? "")]) { confirmed, values in
+            completionHandler(confirmed ? values.first : nil)
+        })
+    }
+
+    // http authentication: the site (or a proxy) asks for a username and password before it answers.
+    // anything else (certificates) is left to webkit.
+    func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let asksForPassword = [NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM]
+            .contains(challenge.protectionSpace.authenticationMethod)
+        guard asksForPassword, let onAuthenticate else { return completionHandler(.performDefaultHandling, nil) }
+        // declining goes on without credentials, which shows whatever the site sends to those who can't sign in
+        onAuthenticate(challenge) { credential in
+            completionHandler(credential == nil ? .performDefaultHandling : .useCredential, credential)
+        }
+    }
+
+    // MARK: - File Uploads
+
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        guard let window = webView.window, window.attachedSheet == nil else { return completionHandler(nil) }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.prompt = "Choose"
+        let types = Self.acceptedTypes(parameters)
+        if !types.isEmpty, !parameters.allowsDirectories { panel.allowedContentTypes = types }
+        panel.beginSheetModal(for: window) { response in
+            completionHandler(response == .OK ? panel.urls : nil)
+        }
+    }
+
+    // the types the input accepts (its accept attribute), as webkit works them out from its mime types
+    // and extensions, so only those can be picked, like safari. webkit has no public call for it: without
+    // it, any file can be picked, which the page checks anyway.
+    private static func acceptedTypes(_ parameters: WKOpenPanelParameters) -> [UTType] {
+        let key = "_allowedFileExtensions"
+        guard parameters.responds(to: NSSelectorFromString(key)), let extensions = parameters.value(forKey: key) as? [String] else { return [] }
+        return extensions.compactMap { UTType(filenameExtension: $0) }
     }
 
     // MARK: - Drops

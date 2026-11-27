@@ -507,10 +507,15 @@ class MainWindowController: NSWindowController {
         handleTabSwitch()
     }
 
-    // what to show when the current tab goes: the one shown before it, else the first tab
-    func fallbackTabId(excluding id: UUID?) -> UUID? {
-        if let previous = previousTabId, previous != id, tab(for: previous) != nil, tab(for: previous)?.favoriteClosed != true { return previous }
-        return tabs.first(where: { $0.id != id })?.id
+    // what to show when the current tab goes: the one shown before it, else the first tab, else the
+    // favorite used last. with none open, a closed one opens again (the last), but only when `reopening`:
+    // closing favorites one by one has to end in the window closing, rather than cycling through them.
+    func fallbackTabId(excluding id: UUID?, reopening: Bool = false) -> UUID? {
+        if let previous = previousTabId, previous != id, let candidate = tab(for: previous), !candidate.favoriteClosed { return previous }
+        if let first = tabs.first(where: { $0.id != id }) { return first.id }
+        let others = favoriteTabs.filter { $0.id != id }
+        let open = others.filter { !$0.favoriteClosed }
+        return (open.max(by: { $0.lastAccessedAt < $1.lastAccessedAt }) ?? (reopening ? others.last : nil))?.id
     }
 
     func handleTabSwitch() {
@@ -563,7 +568,27 @@ class MainWindowController: NSWindowController {
         state.onNewWindowRequested = { [weak self] url in
             self?.windowManager?.newWindow(url: url.absoluteString)
         }
+        state.onOpenPage = { [weak self] configuration, url, switchTo in
+            self?.openPage(configuration, url: url, switchTo: switchTo)
+        }
+        let id = state.tabId
+        state.onClose = { [weak self] in
+            guard let self, let tab = self.tabs.first(where: { $0.id == id }) else { return }
+            self.closeTab(tab)
+        }
         browserStates[state.tabId] = state
+    }
+
+    // a page another page opened (a sign-in window, a link to a new window): a new tab, whose web view
+    // webkit loads the page into, which keeps it tied to its opener. closing it comes back to the opener,
+    // the tab shown before it.
+    func openPage(_ configuration: WKWebViewConfiguration, url: URL?, switchTo: Bool) -> WKWebView {
+        let tab = tabManager.createTab(in: windowModel, url: url?.absoluteString ?? "about:blank", switchTo: switchTo)
+        let state = BrowserState(tabId: tab.id, tabManager: tabManager, historyManager: historyManager, initialURL: nil, opening: configuration)
+        adopt(state)
+        refreshTabs()
+        if switchTo { handleTabSwitch() }
+        return state.webView
     }
 
     // the tab's page goes, kept with the tab to come back as it was when the tab is shown again.
@@ -637,15 +662,10 @@ class MainWindowController: NSWindowController {
         tabManager.closeTab(tab, in: windowModel)
         // the page is read for reopening once it has stopped showing, which it does below
         state?.captureState { [tabManager] page in tabManager.closedTabStateCaptured(id, page) }
-        if windowModel.tabs.isEmpty, currentTab == nil {
-            // Last tab closed: close the window (deferred so this call can unwind before the window
-            // - and this controller - go away). The app stays alive even with no windows.
-            DispatchQueue.main.async { [weak self] in self?.window?.close() }
-            return
-        }
         if windowModel.currentTabId == nil || windowModel.currentTabId == id {
-            windowModel.currentTabId = fallbackTabId(excluding: id)
+            windowModel.currentTabId = fallbackTabId(excluding: id, reopening: true)
         }
+        guard windowModel.currentTabId != nil else { return closeEmptyWindow() }
         refreshTabs()
         handleTabSwitch()
     }
@@ -654,7 +674,14 @@ class MainWindowController: NSWindowController {
     func favoriteClosed(_ id: UUID) {
         guard currentTabId == id else { return }
         windowModel.currentTabId = fallbackTabId(excluding: id)
+        guard windowModel.currentTabId != nil else { return closeEmptyWindow() }
         handleTabSwitch()
+    }
+
+    // nothing is left to show: the window goes (deferred, so the caller can unwind before the window,
+    // and this controller, do). the app stays alive with no windows.
+    private func closeEmptyWindow() {
+        DispatchQueue.main.async { [weak self] in self?.window?.close() }
     }
 
     func reopenLastClosedTab() {
@@ -1067,7 +1094,7 @@ class MainWindowController: NSWindowController {
                 urlToLoad = "https://www.google.com/search?q=\(encoded)"
             }
         case .directURL(let url):
-            urlToLoad = url.contains("://") ? url : "https://\(url)"
+            urlToLoad = withDefaultScheme(url)
         case .dnsResolved(let hostname):
             urlToLoad = "http://\(hostname)"
         case .historyEntry(_, let url):
